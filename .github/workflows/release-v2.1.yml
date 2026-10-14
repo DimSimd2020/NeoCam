@@ -1,0 +1,83 @@
+name: Build and publish NeoCam v2.1 APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-v2.1.yml
+      - app/build.gradle.kts
+      - gradle.properties
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: neocam-v2.1-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, verify, and publish APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android API 35
+        run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace :app:assembleRelease
+
+      - name: Verify and rename APK
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/release/app-release.apk"
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+          cp "$APK" NeoCam-v2.1.apk
+          sha256sum NeoCam-v2.1.apk | tee NeoCam-v2.1.apk.sha256
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeoCam-v2.1
+          path: |
+            NeoCam-v2.1.apk
+            NeoCam-v2.1.apk.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release v2.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'EOF'
+          NeoCam v2.1 installable Android APK, built from the repository source with the Gradle `assembleRelease` task.
+
+          **Signing note:** The project currently configures its release build to use the Android debug signing key. This APK is therefore **debug-key-signed**, not production-key-signed; installing updates from a different key may require uninstalling the previous app first.
+          EOF
+          if gh release view v2.1 >/dev/null 2>&1; then
+            gh release upload v2.1 NeoCam-v2.1.apk NeoCam-v2.1.apk.sha256 --clobber
+          else
+            gh release create v2.1 NeoCam-v2.1.apk NeoCam-v2.1.apk.sha256 \
+              --target "$GITHUB_SHA" \
+              --title "NeoCam v2.1" \
+              --notes-file release-notes.md \
+              --latest
+          fi
