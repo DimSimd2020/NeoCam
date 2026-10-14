@@ -1,0 +1,20 @@
+# Build outputs
+.gradle/
+.kotlin/
+build/
+app/build/
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+gradle-wrapper-shared-*.jar
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+captures/
+.externalNativeBuild/
+.cxx/
