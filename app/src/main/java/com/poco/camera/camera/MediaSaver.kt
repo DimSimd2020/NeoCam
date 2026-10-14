@@ -10,31 +10,37 @@ import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.util.Log
 import androidx.exifinterface.media.ExifInterface
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 object MediaSaver {
     const val ALBUM = "DCIM/NeoCam"
-    const val AUTHOR = "DimSimd"
-    const val SOFTWARE = "NeoCam by DimSimd"
+    private val seq = AtomicInteger(0)
 
-    fun newName(prefix: String): String =
-        prefix + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+    fun newBaseName(prefix: String): String {
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val n = (seq.incrementAndGet() % 1000)
+        return "${prefix}${ts}_$n"
+    }
 
-    fun imageValues(name: String, mime: String = "image/jpeg") = ContentValues().apply {
-        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+    fun imageValues(fileNameWithExt: String, mime: String = "image/jpeg") = ContentValues().apply {
+        val clean = if (fileNameWithExt.contains('.')) fileNameWithExt else "$fileNameWithExt.jpg"
+        put(MediaStore.MediaColumns.DISPLAY_NAME, clean)
         put(MediaStore.MediaColumns.MIME_TYPE, mime)
         put(MediaStore.MediaColumns.RELATIVE_PATH, ALBUM)
     }
 
-    fun videoValues(name: String) = ContentValues().apply {
-        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+    fun videoValues(fileNameWithExt: String) = ContentValues().apply {
+        val clean = if (fileNameWithExt.endsWith(".mp4", true)) fileNameWithExt else "$fileNameWithExt.mp4"
+        put(MediaStore.MediaColumns.DISPLAY_NAME, clean)
         put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
         put(MediaStore.MediaColumns.RELATIVE_PATH, ALBUM)
     }
@@ -47,86 +53,115 @@ object MediaSaver {
         ExifInterface.TAG_FOCAL_LENGTH, ExifInterface.TAG_FLASH, ExifInterface.TAG_WHITE_BALANCE,
     )
 
-    /**
-     * Цифровой «супер-зум» (вплоть до 100x Space Zoom) и/или квадратный кроп 1:1:
-     * декодируем только нужную центральную область через BitmapRegionDecoder (чтобы не держать 200 МП в RAM),
-     * поворачиваем по EXIF и масштабируем до оптимального размера.
-     */
     fun saveProcessed(
         context: Context,
         src: File,
         factor: Float,
         squareCrop: Boolean,
-        name: String,
+        baseName: String,
     ): Uri? {
-        val exif = ExifInterface(src)
-        val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(src.path, bounds)
-        val w = bounds.outWidth
-        val h = bounds.outHeight
-        if (w <= 0 || h <= 0) return null
+        if (!src.exists() || src.length() == 0L) return null
+        if (factor <= 1.02f && !squareCrop) {
+            return insertImageFile(context, src, "$baseName.jpg")
+        }
+        return try {
+            val exif = ExifInterface(src)
+            val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(src.path, bounds)
+            val w = bounds.outWidth
+            val h = bounds.outHeight
+            if (w <= 0 || h <= 0) return insertImageFile(context, src, "$baseName.jpg")
 
-        val baseW = if (squareCrop) min(w, h) else w
-        val baseH = if (squareCrop) min(w, h) else h
-        val z = factor.coerceAtLeast(1f)
-        val cw = (baseW / z).roundToInt().coerceAtLeast(16)
-        val ch = (baseH / z).roundToInt().coerceAtLeast(16)
-        val left = (w - cw) / 2
-        val top = (h - ch) / 2
+            val baseW = if (squareCrop) min(w, h) else w
+            val baseH = if (squareCrop) min(w, h) else h
+            val z = factor.coerceAtLeast(1f)
+            val cw = (baseW / z).roundToInt().coerceIn(16, w)
+            val ch = (baseH / z).roundToInt().coerceIn(16, h)
+            val left = ((w - cw) / 2).coerceAtLeast(0)
+            val top = ((h - ch) / 2).coerceAtLeast(0)
 
-        val region = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            BitmapRegionDecoder.newInstance(src.path)
-        } else {
-            @Suppress("DEPRECATION")
-            BitmapRegionDecoder.newInstance(src.path, false)
-        } ?: return null
+            val region = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                BitmapRegionDecoder.newInstance(src.path)
+            } else {
+                @Suppress("DEPRECATION")
+                BitmapRegionDecoder.newInstance(src.path, false)
+            } ?: return insertImageFile(context, src, "$baseName.jpg")
 
-        val cropped = try {
-            region.decodeRegion(Rect(left, top, left + cw, top + ch), null)
-        } finally {
-            region.recycle()
-        } ?: return null
+            val cropped = try {
+                region.decodeRegion(Rect(left, top, left + cw, top + ch), null)
+            } finally {
+                region.recycle()
+            } ?: return insertImageFile(context, src, "$baseName.jpg")
 
-        val targetLong = min(max(baseW, baseH), 4000)
-        val scale = (targetLong.toFloat() / max(cw, ch)).coerceIn(1f, z.coerceAtMost(8f))
-        val m = orientationMatrix(orientation).apply { preScale(scale, scale) }
-        val out = Bitmap.createBitmap(cropped, 0, 0, cropped.width, cropped.height, m, true)
-        if (out !== cropped) cropped.recycle()
+            val targetLong = min(max(baseW, baseH), 4000)
+            val scale = (targetLong.toFloat() / max(cw, ch)).coerceIn(1f, z.coerceAtMost(6f))
+            val m = orientationMatrix(orientation).apply { preScale(scale, scale) }
+            val out = Bitmap.createBitmap(cropped, 0, 0, cropped.width, cropped.height, m, true)
+            if (out !== cropped) cropped.recycle()
 
-        val tmpOut = File(context.cacheDir, "$name-out.jpg")
-        try {
-            tmpOut.outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 94, it) }
-            out.recycle()
-            val outExif = ExifInterface(tmpOut)
-            exifToCopy.forEach { tag -> exif.getAttribute(tag)?.let { outExif.setAttribute(tag, it) } }
-            outExif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
-            outExif.setAttribute(ExifInterface.TAG_ARTIST, AUTHOR)
-            outExif.setAttribute(ExifInterface.TAG_SOFTWARE, SOFTWARE)
-            outExif.saveAttributes()
-            return insertFile(context, tmpOut, imageValues(name))
-        } finally {
-            tmpOut.delete()
+            val tmpOut = File(context.cacheDir, "$baseName-out.jpg")
+            try {
+                tmpOut.outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                out.recycle()
+                val outExif = ExifInterface(tmpOut)
+                exifToCopy.forEach { tag -> exif.getAttribute(tag)?.let { outExif.setAttribute(tag, it) } }
+                outExif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
+                outExif.saveAttributes()
+                insertImageFile(context, tmpOut, "$baseName.jpg")
+            } finally {
+                tmpOut.delete()
+            }
+        } catch (e: Exception) {
+            Log.e("NeoCam", "saveProcessed fallback to raw file", e)
+            insertImageFile(context, src, "$baseName.jpg")
         }
     }
 
-    /** Копирует файл в альбом PocoCam через MediaStore. */
-    fun insertFile(context: Context, file: File, values: ContentValues): Uri? {
+    fun insertImageFile(context: Context, file: File, fileName: String): Uri? {
+        if (!file.exists() || file.length() == 0L) return null
         val resolver = context.contentResolver
-        values.put(MediaStore.MediaColumns.IS_PENDING, 1)
+        val values = imageValues(fileName).apply {
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
-        resolver.openOutputStream(uri)?.use { os -> file.inputStream().use { it.copyTo(os) } }
-        resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
-        return uri
+        return try {
+            val outStream = resolver.openOutputStream(uri) ?: error("openOutputStream null")
+            outStream.use { os -> file.inputStream().use { it.copyTo(os) } }
+            resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            uri
+        } catch (e: Exception) {
+            Log.e("NeoCam", "insertImageFile failed", e)
+            runCatching { resolver.delete(uri, null, null) }
+            null
+        }
     }
 
-    /** Сохраняет копию любого медиа (фото или видео) в альбом PocoCam. */
+    fun insertVideoFile(context: Context, file: File, fileName: String): Uri? {
+        if (!file.exists() || file.length() == 0L) return null
+        val resolver = context.contentResolver
+        val values = videoValues(fileName).apply {
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+        return try {
+            val outStream = resolver.openOutputStream(uri) ?: error("openOutputStream null")
+            outStream.use { os -> file.inputStream().use { it.copyTo(os) } }
+            resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            uri
+        } catch (e: Exception) {
+            Log.e("NeoCam", "insertVideoFile failed", e)
+            runCatching { resolver.delete(uri, null, null) }
+            null
+        }
+    }
+
     fun copyToAlbum(context: Context, source: Uri, isVideo: Boolean, mime: String): Uri? {
         val resolver = context.contentResolver
         val ext = if (isVideo) "mp4" else when (mime) {
             "image/png" -> "png"; "image/webp" -> "webp"; "image/heic" -> "heic"; else -> "jpg"
         }
-        val name = newName(if (isVideo) "VID_COPY_" else "IMG_COPY_") + "." + ext
+        val name = newBaseName(if (isVideo) "VID_COPY_" else "IMG_COPY_") + "." + ext
         val values = (if (isVideo) videoValues(name) else imageValues(name, mime)).apply {
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }

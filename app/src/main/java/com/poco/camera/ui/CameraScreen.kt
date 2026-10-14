@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.PointF
+import android.graphics.RectF
 import android.os.SystemClock
 import android.view.ViewGroup
 import android.widget.Toast
@@ -44,18 +45,15 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.CameraAlt
 import androidx.compose.material.icons.outlined.Cameraswitch
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Nightlight
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.PlayArrow
-import androidx.compose.material.icons.outlined.ScreenRotationAlt
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -64,7 +62,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -133,6 +130,7 @@ fun CameraScreen(
     val settings by settingsStore.state.collectAsState()
     val live by engine.live.collectAsState()
     val capturingCount by engine.capturing.collectAsState()
+    val peakingBmp by engine.peakingBitmap.collectAsState()
     val qrHit by engine.qr.collectAsState()
     val tilt by sensorTracker.state.collectAsState()
     val latestUri by gallery.latestUri.collectAsState()
@@ -146,16 +144,8 @@ fun CameraScreen(
     var focusTap by remember { mutableStateOf<FocusTapState?>(null) }
     var dismissedQrText by remember { mutableStateOf<String?>(null) }
 
-    // Всплывающее превью последнего мгновенного кадра
-    var popupBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var showInstantPopup by remember { mutableStateOf(false) }
-    var popupJob by remember { mutableStateOf<Job?>(null) }
-
-    // Ручной таймер спуска
     var timerSecondsLeft by remember { mutableIntStateOf(0) }
     var timerJob by remember { mutableStateOf<Job?>(null) }
-
-    // Переворот иконки смены камеры
     var flipAnimDeg by remember { mutableFloatStateOf(0f) }
 
     val previewView = remember {
@@ -169,7 +159,6 @@ fun CameraScreen(
         }
     }
 
-    // Функция мгновенного снимка (0 мс задержка — кадр сразу в RAM и параллельно пишется на диск)
     fun performPhotoCapture() {
         val isFrontFlash = state.facing == CameraSelector.LENS_FACING_FRONT &&
             settings.flash != FlashSetting.OFF &&
@@ -182,7 +171,7 @@ fun CameraScreen(
                 feedback.shutter()
                 shutterFlash = true
                 engine.capturePhotoInstant(mirrorFront = settings.mirrorFront)
-                delay(65)
+                delay(60)
                 shutterFlash = false
                 frontSelfieLight = false
             }
@@ -190,14 +179,13 @@ fun CameraScreen(
             feedback.shutter()
             shutterFlash = true
             scope.launch {
-                delay(55)
+                delay(50)
                 shutterFlash = false
             }
             engine.capturePhotoInstant(mirrorFront = settings.mirrorFront)
         }
     }
 
-    // Контроллер «Аимбота»
     val aimController = remember {
         AimController(
             scope = scope,
@@ -208,44 +196,27 @@ fun CameraScreen(
     }
     val aimUi by aimController.ui.collectAsState()
 
-    LaunchedEffect(settings.aimDelay) {
+    LaunchedEffect(settings.aimDelay, settings.autoShoot) {
         aimController.countdownSeconds = settings.aimDelay
+        aimController.autoShootEnabled = settings.autoShoot
     }
 
-    LaunchedEffect(settings.profile) {
-        engine.setProfile(settings.profile)
-    }
-
-    // Инициализация движка камеры
     LaunchedEffect(Unit) {
         engine.init()
     }
 
-    // Подписка на мгновенные снимки (0 мс) и завершение записи в MediaStore
     LaunchedEffect(Unit) {
         engine.events.collect { ev ->
             when (ev) {
-                is EngineEvent.InstantCaptured -> {
-                    gallery.onInstantCaptured(ev.shotId, ev.bitmap, ev.name)
-                    if (settings.instantReview) {
-                        popupBitmap = ev.bitmap
-                        showInstantPopup = true
-                        popupJob?.cancel()
-                        popupJob = scope.launch {
-                            delay(2800)
-                            showInstantPopup = false
-                        }
-                    }
-                }
+                is EngineEvent.InstantCaptured -> gallery.onInstantCaptured(ev.shotId, ev.bitmap, ev.name)
                 is EngineEvent.Saved -> gallery.onNewSavedUri(ev.shotId, ev.uri, ev.isVideo)
                 is EngineEvent.Error -> Toast.makeText(context, ev.message, Toast.LENGTH_SHORT).show()
             }
         }
     }
 
-    // Передача кадров из анализатора в AimController
-    LaunchedEffect(settings.aim, state.mode, showGallery, showSettings, timerSecondsLeft) {
-        if (!settings.aim || !state.mode.isPhotoLike || showGallery || showSettings || timerSecondsLeft > 0) {
+    LaunchedEffect(settings.autoTrack, state.mode, showGallery, showSettings, timerSecondsLeft) {
+        if (!settings.autoTrack || !state.mode.isPhotoLike || showGallery || showSettings || timerSecondsLeft > 0) {
             aimController.reset()
             return@LaunchedEffect
         }
@@ -254,12 +225,9 @@ fun CameraScreen(
         }
     }
 
-    // Автоскрытие QR-баннера через 6 секунд после последнего обнаружения
-    var lastQrAt by remember { mutableLongStateOf(0L) }
     LaunchedEffect(qrHit) {
         val hit = qrHit ?: return@LaunchedEffect
         if (hit.text != dismissedQrText) {
-            lastQrAt = hit.at
             delay(6000)
             if (engine.qr.value?.at == hit.at) {
                 engine.qr.value = null
@@ -267,21 +235,18 @@ fun CameraScreen(
         }
     }
 
-    // Автоскрытие кольца фокуса (если не заблокировано AE/AF)
     LaunchedEffect(focusTap) {
         val tap = focusTap ?: return@LaunchedEffect
         if (!tap.locked) {
-            delay(3200)
+            delay(3000)
             if (focusTap?.id == tap.id) focusTap = null
         }
     }
 
-    // Синхронизация режима вспышки с ImageCapture
     LaunchedEffect(settings.flash, state.bound, state.facing) {
         engine.setFlash(settings.flash)
     }
 
-    // Сброс фокуса/аимбота при смене объектива или режима
     LaunchedEffect(state.lensId, state.mode) {
         focusTap = null
         aimController.reset()
@@ -291,7 +256,6 @@ fun CameraScreen(
         }
     }
 
-    // Жизненный цикл датчиков и галереи
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -316,7 +280,6 @@ fun CameraScreen(
         }
     }
 
-    // Действие по нажатию главной кнопки затвора / записи
     fun triggerPrimaryShutter() {
         if (showGallery || showSettings) return
         if (state.mode == CamMode.VIDEO) {
@@ -358,7 +321,6 @@ fun CameraScreen(
         }
     }
 
-    // Обработка кнопок громкости
     LaunchedEffect(Unit) {
         volumeKeys.collect { key ->
             if (showGallery || showSettings) return@collect
@@ -373,9 +335,6 @@ fun CameraScreen(
         }
     }
 
-    // Активен ли режим Samsung Galaxy Z Flip 7 FlexCam (по датчику сгиба шарнира 65..140° или вручную)
-    val flexActive = settings.profile.supportsFlexCam && (settings.flexModeManual || tilt.isFlexPosture)
-
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
@@ -385,11 +344,7 @@ fun CameraScreen(
         val containerH = maxHeight.value.coerceAtLeast(1f)
         val fullRatio = (containerH / containerW).coerceAtLeast(1.33f)
 
-        val effectiveAspect = when {
-            flexActive -> Aspect.R1_1
-            state.mode == CamMode.VIDEO -> Aspect.R16_9
-            else -> settings.aspect
-        }
+        val effectiveAspect = if (state.mode == CamMode.VIDEO) Aspect.R16_9 else settings.aspect
         val targetViewRatio = when (effectiveAspect) {
             Aspect.R1_1 -> 1f
             Aspect.R4_3 -> 4f / 3f
@@ -397,44 +352,57 @@ fun CameraScreen(
             Aspect.FULL -> fullRatio
         }
 
-        // Обновляем флаги анализатора кадров (при открытой галерее ставим анализ на паузу без отвязки камеры!)
-        val needAnalysis = state.mode.isPhotoLike && (settings.aim || settings.qr)
-        LaunchedEffect(settings.aim, settings.qr, state.facing, targetViewRatio, state.mode, showGallery) {
+        LaunchedEffect(effectiveAspect) {
+            engine.currentAspect = effectiveAspect
+        }
+
+        val focusRoi = remember(focusTap, aimUi.target) {
+            focusTap?.point?.let { pt ->
+                RectF(pt.x - 0.18f, pt.y - 0.18f, pt.x + 0.18f, pt.y + 0.18f)
+            } ?: aimUi.target?.rect
+        }
+
+        LaunchedEffect(
+            settings.autoTrack,
+            settings.qr,
+            settings.focusPeaking,
+            state.facing,
+            targetViewRatio,
+            state.mode,
+            showGallery,
+            focusRoi,
+        ) {
             engine.analysisFlags = VisionAnalyzer.Flags(
-                objects = !showGallery && settings.aim && state.mode.isPhotoLike,
+                objects = !showGallery && settings.autoTrack && state.mode.isPhotoLike,
                 qr = !showGallery && settings.qr && state.mode.isPhotoLike,
+                peaking = !showGallery && settings.focusPeaking && state.mode.isPhotoLike,
                 mirror = state.facing == CameraSelector.LENS_FACING_FRONT,
                 viewAspect = 1f / targetViewRatio,
+                focusRegion = focusRoi,
             )
         }
 
-        // Привязка CameraX (держим сессию живой даже во время просмотра галереи — 0 мс возврат!)
+        // Привязка CameraX только при реальной смене камеры, режима или соотношения сторон (4:3 vs 16:9)
         val lensId = state.lensId
+        val useWide = effectiveAspect == Aspect.R16_9 || effectiveAspect == Aspect.FULL
         if (state.ready && lensId != null) {
             val bindCfg = remember(
                 lensId,
                 state.mode,
-                effectiveAspect == Aspect.R16_9 || effectiveAspect == Aspect.FULL,
+                useWide,
                 settings.highRes,
-                settings.zeroLag,
-                needAnalysis,
                 settings.videoRes,
                 settings.fps60,
                 settings.stabilization,
-                settings.profile,
             ) {
                 BindConfig(
                     lensId = lensId,
                     mode = state.mode,
-                    aspect = effectiveAspect,
+                    useWideRatio = useWide,
                     highRes = settings.highRes && (state.mode == CamMode.PHOTO || state.mode == CamMode.PRO),
-                    zeroLag = settings.zeroLag,
-                    analysis = needAnalysis,
                     videoRes = settings.videoRes,
                     fps60 = settings.fps60,
                     stabilization = settings.stabilization,
-                    profile = settings.profile,
-                    viewRatio = targetViewRatio,
                 )
             }
             LaunchedEffect(bindCfg) {
@@ -443,35 +411,31 @@ fun CameraScreen(
             }
         }
 
-        val maxPreviewHeight = if (flexActive) containerH * 0.48f else containerH
         val previewHeightDp by animateDpAsState(
-            targetValue = (containerW * targetViewRatio).coerceAtMost(maxPreviewHeight).dp,
+            targetValue = (containerW * targetViewRatio).coerceAtMost(containerH).dp,
             animationSpec = tween(220),
             label = "previewHeight",
         )
 
-        val previewAlign = when {
-            flexActive -> Alignment.TopCenter
-            effectiveAspect == Aspect.R4_3 || effectiveAspect == Aspect.R1_1 -> Alignment.TopCenter
+        val previewAlign = when (effectiveAspect) {
+            Aspect.R4_3, Aspect.R1_1 -> Alignment.TopCenter
             else -> Alignment.Center
         }
-        val previewTopPad = when {
-            flexActive -> 36.dp
-            effectiveAspect == Aspect.R1_1 -> 96.dp
-            effectiveAspect == Aspect.R4_3 -> 76.dp
+        val previewTopPad = when (effectiveAspect) {
+            Aspect.R1_1 -> 96.dp
+            Aspect.R4_3 -> 72.dp
             else -> 0.dp
         }
 
-        // Контейнер видоискателя
+        // Видоискатель в стиле GCam
         Box(
             modifier = Modifier
                 .align(previewAlign)
                 .padding(top = previewTopPad)
                 .fillMaxWidth()
                 .height(previewHeightDp)
-                .clip(RoundedCornerShape(if (effectiveAspect == Aspect.FULL && !flexActive) 0.dp else 22.dp))
+                .clip(RoundedCornerShape(if (effectiveAspect == Aspect.FULL) 0.dp else 24.dp))
                 .clipToBounds()
-                // Мультитач зум щипком
                 .pointerInput(state.ready) {
                     awaitEachGesture {
                         var zoomActive = false
@@ -492,16 +456,15 @@ fun CameraScreen(
                         }
                     }
                 }
-                // Тап для фокуса / выбора цели аимбота, двойной тап для 1x/2x, долгий тап для AE/AF БЛОК
-                .pointerInput(settings.aim, state.mode, state.extraZoom) {
+                .pointerInput(settings.autoTrack, state.mode, state.extraZoom) {
                     detectTapGestures(
                         onTap = { pos ->
-                            val nx = (pos.x / size.width).coerceIn(0.02f, 0.98f)
-                            val ny = (pos.y / size.height).coerceIn(0.02f, 0.98f)
+                            val nx = (pos.x / size.width).coerceIn(0.03f, 0.97f)
+                            val ny = (pos.y / size.height).coerceIn(0.03f, 0.97f)
                             feedback.tap()
-                            if (settings.aim && state.mode.isPhotoLike) {
+                            if (settings.autoTrack && state.mode.isPhotoLike) {
                                 val raw = unzoomPoint(nx, ny, state.extraZoom)
-                                if (aimController.select(raw.x, raw.y)) return@detectTapGestures
+                                aimController.select(raw.x, raw.y)
                             }
                             engine.focusAt(nx, ny, lock = false)
                             focusTap = FocusTapState(
@@ -520,8 +483,8 @@ fun CameraScreen(
                             engine.setZoom(nextZoom)
                         },
                         onLongPress = { pos ->
-                            val nx = (pos.x / size.width).coerceIn(0.02f, 0.98f)
-                            val ny = (pos.y / size.height).coerceIn(0.02f, 0.98f)
+                            val nx = (pos.x / size.width).coerceIn(0.03f, 0.97f)
+                            val ny = (pos.y / size.height).coerceIn(0.03f, 0.97f)
                             feedback.focusLocked()
                             engine.focusAt(nx, ny, lock = true)
                             focusTap = FocusTapState(
@@ -532,7 +495,6 @@ fun CameraScreen(
                         },
                     )
                 }
-                // Вертикальный свайп по видоискателю для быстрой регулировки экспозиции (EV)
                 .pointerInput(state.evRange) {
                     var accum = 0f
                     detectVerticalDragGestures(
@@ -565,6 +527,17 @@ fun CameraScreen(
                     },
             )
 
+            // Подсветка резких краёв в фокусе (Focus Peaking)
+            if (settings.focusPeaking && state.mode.isPhotoLike) {
+                FocusPeakingOverlay(
+                    bitmap = peakingBmp,
+                    modifier = Modifier.graphicsLayer {
+                        scaleX = state.extraZoom
+                        scaleY = state.extraZoom
+                    },
+                )
+            }
+
             if (settings.grid) {
                 GridOverlay()
             }
@@ -576,7 +549,7 @@ fun CameraScreen(
                 )
             }
 
-            if (settings.aim && state.mode.isPhotoLike) {
+            if (settings.autoTrack && state.mode.isPhotoLike && focusTap == null) {
                 AimOverlay(
                     aim = aimUi,
                     extraZoom = state.extraZoom,
@@ -587,56 +560,21 @@ fun CameraScreen(
                 focusTap = focusTap,
                 evIndex = state.evIndex,
                 evRange = state.evRange,
-                evStep = state.evStep,
             )
 
-            // Радар-карта 20x–100x Space Zoom (Samsung S25 Ultra)
-            if (settings.profile.supportsSpaceZoomMap) {
-                SpaceZoomMapOverlay(
-                    zoom = state.zoom,
-                    extraZoom = state.extraZoom,
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(top = 14.dp, end = 14.dp),
-                )
-            }
-
-            // Бейдж Авто-Макро (Focus Enhancer)
-            MacroBadge(
-                active = state.macroAutoActive,
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(start = 14.dp, bottom = 14.dp),
-            )
-
-            // Мгновенное всплывающее превью («Нажал — сфоткало — сразу посмотрел»)
-            InstantShotPopup(
-                bitmap = popupBitmap,
-                visible = showInstantPopup,
-                onOpenNow = {
-                    showInstantPopup = false
-                    showGallery = true
-                },
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(end = 14.dp, bottom = 14.dp),
-            )
-
-            // Мгновенная вспышка затвора (55 мс)
             AnimatedVisibility(
                 visible = shutterFlash,
                 enter = fadeIn(tween(20)),
-                exit = fadeOut(tween(80)),
+                exit = fadeOut(tween(70)),
             ) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(Color.White.copy(alpha = 0.65f)),
+                        .background(Color.Black.copy(alpha = 0.65f)),
                 )
             }
         }
 
-        // Экранная подсветка при селфи со вспышкой
         AnimatedVisibility(
             visible = frontSelfieLight,
             enter = fadeIn(tween(40)),
@@ -649,7 +587,6 @@ fun CameraScreen(
             )
         }
 
-        // Крупный отсчёт ручного таймера в центре
         AnimatedVisibility(
             visible = timerSecondsLeft > 0,
             enter = scaleIn() + fadeIn(),
@@ -659,75 +596,27 @@ fun CameraScreen(
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .size(104.dp)
+                    .size(96.dp)
                     .glass(CircleShape, strong = true)
                     .border(2.dp, Pc.Accent, CircleShape),
             ) {
                 Text(
                     text = timerSecondsLeft.toString(),
                     color = Pc.Accent,
-                    fontSize = 48.sp,
+                    fontSize = 44.sp,
                     fontWeight = FontWeight.Bold,
                 )
             }
         }
 
-        // Плашка длительной выдержки / ночного снимка (в обычном фото не блокирует экран!)
-        AnimatedVisibility(
-            visible = capturingCount > 0 && (state.mode == CamMode.NIGHT || (state.mode == CamMode.PRO && (proValues.shutterNs ?: 0L) >= 250_000_000L)),
-            enter = fadeIn() + scaleIn(),
-            exit = fadeOut() + scaleOut(),
-            modifier = Modifier.align(Alignment.Center),
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .glass(RoundedCornerShape(20.dp), strong = true)
-                    .border(1.dp, Pc.Accent.copy(alpha = 0.6f), RoundedCornerShape(20.dp))
-                    .padding(horizontal = 18.dp, vertical = 12.dp),
-            ) {
-                CircularProgressIndicator(
-                    color = Pc.Accent,
-                    strokeWidth = 2.5.dp,
-                    modifier = Modifier.size(22.dp),
-                )
-                Spacer(Modifier.width(12.dp))
-                Column {
-                    Text(
-                        text = "Ночная склейка кадра…",
-                        color = Pc.Text,
-                        style = MaterialTheme.typography.titleMedium,
-                    )
-                    Text(
-                        text = "Держите смартфон неподвижно",
-                        color = Pc.TextDim,
-                        fontSize = 12.sp,
-                    )
-                }
-            }
-        }
-
-        state.error?.let { err ->
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .padding(24.dp)
-                    .glass(RoundedCornerShape(18.dp), strong = true)
-                    .padding(16.dp),
-            ) {
-                Text(text = err, color = Pc.Record, style = MaterialTheme.typography.bodyMedium)
-            }
-        }
-
-        // ---------------- Верхняя зона управления ----------------
+        // Верхняя панель
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
                 .statusBarsPadding()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(horizontal = 14.dp, vertical = 8.dp),
         ) {
             val rec = state.recording
             if (rec != null) {
@@ -739,7 +628,6 @@ fun CameraScreen(
                 TopControlBar(
                     state = state,
                     settings = settings,
-                    flexActive = flexActive,
                     uiRotation = tilt.uiRotation,
                     onCycleFlash = {
                         feedback.tap()
@@ -754,23 +642,15 @@ fun CameraScreen(
                         feedback.tap()
                         engine.setTorch(!state.torch)
                     },
-                    onToggleAim = {
+                    onTogglePeaking = {
                         feedback.tap()
-                        settingsStore.update { it.copy(aim = !it.aim) }
-                    },
-                    onToggleFlex = {
-                        feedback.tap()
-                        settingsStore.update { it.copy(flexModeManual = !it.flexModeManual) }
+                        settingsStore.update { it.copy(focusPeaking = !it.focusPeaking) }
                     },
                     onCycleAspect = {
                         feedback.tap()
                         val list = Aspect.entries
                         val next = list[(list.indexOf(settings.aspect) + 1) % list.size]
                         settingsStore.update { it.copy(aspect = next) }
-                    },
-                    onToggleHighRes = {
-                        feedback.tap()
-                        settingsStore.update { it.copy(highRes = !it.highRes) }
                     },
                     onCycleVideoRes = {
                         feedback.tap()
@@ -785,7 +665,7 @@ fun CameraScreen(
                     },
                     onCycleTimer = {
                         feedback.tap()
-                        val timers = listOf(0, 3, 5, 10)
+                        val timers = listOf(0, 3, 10)
                         val next = timers[(timers.indexOf(settings.timer) + 1) % timers.size]
                         settingsStore.update { it.copy(timer = next) }
                     },
@@ -796,7 +676,7 @@ fun CameraScreen(
                 )
             }
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
 
             ExposureLockBadge(
                 aeAfLocked = state.aeAfLocked,
@@ -824,54 +704,15 @@ fun CameraScreen(
             )
         }
 
-        // ---------------- Нижняя зона: пульт управления (или нижняя половина Z Flip 7 FlexCam) ----------------
+        // Нижняя панель GCam
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = if (flexActive) Arrangement.SpaceEvenly else Arrangement.Bottom,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .let { m ->
-                    if (flexActive) {
-                        m.height((containerH * 0.48f).dp)
-                            .clip(RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp))
-                            .background(Pc.Surface.copy(alpha = 0.94f))
-                            .border(1.dp, Pc.GlassStroke, RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp))
-                            .padding(top = 10.dp)
-                    } else {
-                        m
-                    }
-                }
                 .navigationBarsPadding()
-                .padding(bottom = 14.dp),
+                .padding(bottom = 16.dp),
         ) {
-            if (flexActive) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .glass(CircleShape, strong = true)
-                        .padding(horizontal = 12.dp, vertical = 4.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.ScreenRotationAlt,
-                        contentDescription = null,
-                        tint = Pc.Accent,
-                        modifier = Modifier.size(14.dp),
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        text = buildString {
-                            append("GALAXY Z FLIP 7 • FLEXCAM")
-                            tilt.hingeAngleDeg?.let { append(" (${it.toInt()}°)") }
-                        },
-                        color = Pc.Accent,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                    )
-                }
-            }
-
-            // Панель PRO-режима
             AnimatedVisibility(
                 visible = state.mode == CamMode.PRO && state.recording == null,
                 enter = fadeIn() + scaleIn(initialScale = 0.95f),
@@ -896,22 +737,18 @@ fun CameraScreen(
                 )
             }
 
-            // Панель зума
             if (state.mode != CamMode.PORTRAIT && state.mode != CamMode.NIGHT) {
                 ZoomBar(
                     zoom = state.zoom,
                     minZoom = state.minZoom,
                     maxZoom = state.maxZoom,
-                    hwMaxZoom = state.hwMaxZoom,
-                    profile = settings.profile,
-                    lenses = engine.lenses,
+                    stops = state.zoomStops,
                     onZoomChange = { z -> engine.setZoom(z) },
                     onStepTick = { feedback.tick() },
                     modifier = Modifier.padding(bottom = 12.dp),
                 )
             }
 
-            // Карусель режимов
             AnimatedVisibility(visible = state.recording == null) {
                 ModeSelectorRow(
                     state = state,
@@ -919,11 +756,10 @@ fun CameraScreen(
                         feedback.tick()
                         engine.setMode(m)
                     },
-                    modifier = Modifier.padding(bottom = 14.dp),
+                    modifier = Modifier.padding(bottom = 16.dp),
                 )
             }
 
-            // Главный ряд кнопки затвора
             BottomShutterRow(
                 state = state,
                 latestUri = latestUri,
@@ -934,7 +770,6 @@ fun CameraScreen(
                 flipAnimDeg = flipAnimDeg,
                 onOpenGallery = {
                     feedback.tap()
-                    showInstantPopup = false
                     showGallery = true
                 },
                 onTogglePause = {
@@ -947,17 +782,14 @@ fun CameraScreen(
                     flipAnimDeg += 180f
                     engine.switchFacing()
                 },
-                onVideoSnapshot = {
-                    performPhotoCapture()
-                },
             )
         }
 
-        // Полноэкранная галерея поверх камеры (без отвязки CameraX — 0 мс вход и 0 мс возврат!)
+        // Полноэкранная галерея поверх камеры (0 мс открытие и закрытие)
         AnimatedVisibility(
             visible = showGallery,
-            enter = fadeIn(tween(110)),
-            exit = fadeOut(tween(110)),
+            enter = fadeIn(tween(100)),
+            exit = fadeOut(tween(100)),
         ) {
             GalleryScreen(
                 gallery = gallery,
@@ -995,7 +827,7 @@ private fun RecordingTimerPill(
             modifier = Modifier
                 .size(9.dp)
                 .clip(CircleShape)
-                .background(if (paused) Color(0xFFFFD54F) else Pc.Record),
+                .background(if (paused) Pc.Accent else Pc.Record),
         )
         Spacer(Modifier.width(8.dp))
         Text(
@@ -1004,15 +836,6 @@ private fun RecordingTimerPill(
             fontSize = 14.sp,
             fontWeight = FontWeight.Bold,
         )
-        if (paused) {
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = "ПАУЗА",
-                color = Color(0xFFFFD54F),
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-            )
-        }
     }
 }
 
@@ -1033,11 +856,11 @@ private fun ModeSelectorRow(
     }
 
     Row(
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
         modifier = modifier
             .glass(CircleShape, strong = true)
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .padding(horizontal = 6.dp, vertical = 4.dp),
     ) {
         availableModes.forEach { mode ->
             val selected = state.mode == mode
@@ -1045,22 +868,15 @@ private fun ModeSelectorRow(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
                     .clip(CircleShape)
-                    .let {
-                        if (selected) {
-                            it.background(Pc.AccentBrush).border(1.dp, Pc.Accent, CircleShape)
-                        } else {
-                            it
-                        }
-                    }
+                    .background(if (selected) Pc.Accent.copy(alpha = 0.22f) else Color.Transparent)
                     .clickable { onSelectMode(mode) }
-                    .padding(horizontal = 13.dp, vertical = 6.dp),
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
             ) {
                 Text(
                     text = mode.title,
-                    color = if (selected) Pc.Text else Pc.TextDim,
-                    fontSize = 12.sp,
-                    fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
-                    letterSpacing = 0.6.sp,
+                    color = if (selected) Pc.Accent else Pc.TextDim,
+                    fontSize = 13.sp,
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
                 )
             }
         }
@@ -1080,10 +896,9 @@ private fun BottomShutterRow(
     onTogglePause: () -> Unit,
     onShutterClick: () -> Unit,
     onFlipCamera: () -> Unit,
-    onVideoSnapshot: () -> Unit,
 ) {
-    val rot by animateFloatAsState(targetValue = uiRotation, animationSpec = tween(250), label = "bottomRot")
-    val flipRot by animateFloatAsState(targetValue = flipAnimDeg + uiRotation, animationSpec = tween(350), label = "flipRot")
+    val rot by animateFloatAsState(targetValue = uiRotation, animationSpec = tween(220), label = "bottomRot")
+    val flipRot by animateFloatAsState(targetValue = flipAnimDeg + uiRotation, animationSpec = tween(320), label = "flipRot")
     val rec = state.recording
     val isVideo = state.mode == CamMode.VIDEO
 
@@ -1094,7 +909,6 @@ private fun BottomShutterRow(
             .fillMaxWidth()
             .padding(horizontal = 24.dp),
     ) {
-        // Левая кнопка: Миниатюра галереи (показывает мгновенный Bitmap за 0 мс!) ИЛИ Пауза во время записи
         if (rec != null) {
             IconButton(
                 onClick = onTogglePause,
@@ -1116,7 +930,7 @@ private fun BottomShutterRow(
                 modifier = Modifier
                     .size(54.dp)
                     .glass(CircleShape, strong = true)
-                    .border(1.5.dp, if (latestBitmap != null) Pc.Accent else Pc.GlassStroke, CircleShape)
+                    .border(1.5.dp, Pc.GlassStroke, CircleShape)
                     .clickable(onClick = onOpenGallery)
                     .rotate(rot),
             ) {
@@ -1125,7 +939,7 @@ private fun BottomShutterRow(
                         val imgBmp = remember(latestBitmap) { latestBitmap.asImageBitmap() }
                         Image(
                             bitmap = imgBmp,
-                            contentDescription = "Последний снимок",
+                            contentDescription = "Галерея",
                             contentScale = ContentScale.Crop,
                             modifier = Modifier
                                 .fillMaxSize()
@@ -1156,33 +970,28 @@ private fun BottomShutterRow(
             }
         }
 
-        // Центральная кнопка Затвора / Записи видео в стиле Чёрный Обсидиан + Синий Неон
+        // Кнопка затвора GCam
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
-                .size(84.dp)
+                .size(80.dp)
                 .clip(CircleShape)
-                .background(Color(0xFF040812))
                 .border(
-                    width = 3.5.dp,
-                    brush = if (isVideo) {
-                        androidx.compose.ui.graphics.Brush.linearGradient(listOf(Pc.Record, Color(0xFFFF6B8B)))
-                    } else {
-                        Pc.RingBrush
-                    },
+                    width = 3.dp,
+                    color = if (isVideo) Pc.Record else Pc.Accent,
                     shape = CircleShape,
                 )
                 .clickable(onClick = onShutterClick)
-                .padding(7.dp),
+                .padding(6.dp),
         ) {
             val innerSize by animateDpAsState(
-                targetValue = if (rec != null) 34.dp else 64.dp,
-                animationSpec = tween(180),
+                targetValue = if (rec != null) 32.dp else 62.dp,
+                animationSpec = tween(160),
                 label = "shutterInnerSize",
             )
             val innerCorner by animateDpAsState(
-                targetValue = if (rec != null) 10.dp else 32.dp,
-                animationSpec = tween(180),
+                targetValue = if (rec != null) 10.dp else 31.dp,
+                animationSpec = tween(160),
                 label = "shutterInnerCorner",
             )
 
@@ -1191,17 +1000,7 @@ private fun BottomShutterRow(
                 modifier = Modifier
                     .size(innerSize)
                     .clip(RoundedCornerShape(innerCorner))
-                    .let {
-                        if (isVideo) {
-                            it.background(Pc.Record)
-                        } else {
-                            it.background(
-                                androidx.compose.ui.graphics.Brush.radialGradient(
-                                    colors = listOf(Color(0xFF0E2954), Color(0xFF050B16)),
-                                )
-                            ).border(2.dp, Pc.Accent, RoundedCornerShape(innerCorner))
-                        }
-                    },
+                    .background(if (isVideo) Pc.Record else Pc.Text),
             ) {
                 AnimatedContent(
                     targetState = Triple(timerSecondsLeft > 0, capturingCount > 0, state.mode),
@@ -1210,26 +1009,20 @@ private fun BottomShutterRow(
                     when {
                         inTimer -> Icon(
                             imageVector = Icons.Outlined.Close,
-                            contentDescription = "Отмена таймера",
-                            tint = Pc.Accent,
-                            modifier = Modifier.size(26.dp),
+                            contentDescription = "Отмена",
+                            tint = Pc.Bg,
+                            modifier = Modifier.size(24.dp),
                         )
                         isCapturing && mode == CamMode.NIGHT -> CircularProgressIndicator(
-                            color = Pc.Accent,
+                            color = Pc.Bg,
                             strokeWidth = 2.5.dp,
-                            modifier = Modifier.size(24.dp),
+                            modifier = Modifier.size(22.dp),
                         )
                         mode == CamMode.NIGHT -> Icon(
                             imageVector = Icons.Outlined.Nightlight,
                             contentDescription = null,
-                            tint = Pc.Accent,
-                            modifier = Modifier.size(24.dp),
-                        )
-                        !isVideo -> Box(
-                            modifier = Modifier
-                                .size(22.dp)
-                                .clip(CircleShape)
-                                .background(Pc.AccentBrush),
+                            tint = Pc.Bg,
+                            modifier = Modifier.size(22.dp),
                         )
                         else -> Unit
                     }
@@ -1237,26 +1030,8 @@ private fun BottomShutterRow(
             }
         }
 
-        // Правая кнопка: Переключение камеры (фронт/тыл) ИЛИ Фото-снимок во время записи видео
         if (rec != null) {
-            if (state.snapshotAvailable) {
-                IconButton(
-                    onClick = onVideoSnapshot,
-                    modifier = Modifier
-                        .size(54.dp)
-                        .glass(CircleShape, strong = true)
-                        .rotate(rot),
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.CameraAlt,
-                        contentDescription = "Снимок во время видео",
-                        tint = Pc.Text,
-                        modifier = Modifier.size(24.dp),
-                    )
-                }
-            } else {
-                Spacer(Modifier.size(54.dp))
-            }
+            Spacer(Modifier.size(54.dp))
         } else {
             IconButton(
                 onClick = onFlipCamera,

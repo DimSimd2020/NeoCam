@@ -141,9 +141,10 @@ class GalleryRepository(
     fun onNewSavedUri(shotId: Long, uri: Uri, isVideo: Boolean) {
         _latestUri.value = uri
         val pending = pendingShots.remove(shotId)
-        if (pending?.previewBitmap != null) {
+        if (isVideo) {
+            _latestBitmap.value = null
+        } else if (pending?.previewBitmap != null) {
             uriBitmapCache[uri] = pending.previewBitmap
-            // Ограничиваем размер кэша в памяти последними 12 снимками
             if (uriBitmapCache.size > 12) {
                 uriBitmapCache.keys.firstOrNull()?.let { uriBitmapCache.remove(it) }
             }
@@ -154,7 +155,7 @@ class GalleryRepository(
             _albumItems.value = _albumItems.value.map { if (it.id == -shotId) upgraded else it }
             _allItems.value = _allItems.value.map { if (it.id == -shotId) upgraded else it }
         }
-        scheduleRefresh(300L)
+        refresh()
     }
 
     private fun scheduleRefresh(delayMs: Long) {

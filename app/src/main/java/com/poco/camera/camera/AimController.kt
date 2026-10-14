@@ -25,8 +25,9 @@ data class AimUi(
 )
 
 /**
- * «Аимбот»: держит в рамке главный объект, наводит на него фокус и, когда объект
- * в фокусе и не двигается, запускает обратный отсчёт и сам делает снимок.
+ * Трекинг объекта и автофокус в стиле GCam:
+ * плавно сглаживает координаты объекта (EMA-фильтр без дёрганий), удерживает фокус на объекте
+ * и при включённом автоспуске делает снимок, когда объект в фокусе и стабилен.
  */
 class AimController(
     private val scope: CoroutineScope,
@@ -37,9 +38,11 @@ class AimController(
     private val _ui = MutableStateFlow(AimUi())
     val ui: StateFlow<AimUi> = _ui.asStateFlow()
 
-    var countdownSeconds = 3
+    var countdownSeconds = 2
+    var autoShootEnabled = false
 
     private var target: TrackedObj? = null
+    private var smoothRect: RectF? = null
     private var userLocked = false
     private var lastSeenAt = 0L
     private var lastCenter: PointF? = null
@@ -57,6 +60,7 @@ class AimController(
     fun reset() {
         cancelCountdown()
         target = null
+        smoothRect = null
         userLocked = false
         lastCenter = null
         focusedAt = null
@@ -68,13 +72,14 @@ class AimController(
         _ui.value = AimUi()
     }
 
-    /** Тап по объекту на превью — сделать его целью. Возвращает true, если тап попал в объект. */
+    /** Тап по объекту на превью — захватить его в трекинг-фокус. */
     fun select(nx: Float, ny: Float): Boolean {
         val hit = _ui.value.let { listOfNotNull(it.target) + it.others }
             .filter { it.rect.contains(nx, ny) }
             .minByOrNull { it.rect.width() * it.rect.height() } ?: return false
         cancelCountdown()
         target = hit
+        smoothRect = RectF(hit.rect)
         userLocked = true
         focusedAt = null
         focusOk = false
@@ -88,72 +93,90 @@ class AimController(
     fun onFrame(objs: List<TrackedObj>) {
         val now = SystemClock.elapsedRealtime()
         val prev = target
-        var t = prev?.let { p -> objs.firstOrNull { it.id == p.id && p.id >= 0 } ?: objs.maxByOrNull { iou(it.rect, p.rect) }?.takeIf { iou(it.rect, p.rect) > 0.3f } }
-        if (t == null && (!userLocked || now - lastSeenAt > 1500)) {
+        var t = prev?.let { p ->
+            objs.firstOrNull { it.id == p.id && p.id >= 0 }
+                ?: objs.maxByOrNull { iou(it.rect, p.rect) }?.takeIf { iou(it.rect, p.rect) > 0.25f }
+        }
+        if (t == null && (!userLocked || now - lastSeenAt > 1400)) {
             t = pickBest(objs)
             if (t != null) {
                 userLocked = false
-                if (prev == null || iou(t.rect, prev.rect) < 0.3f) onNewTarget()
+                if (prev == null || iou(t.rect, prev.rect) < 0.25f) onNewTarget()
             }
         }
 
         if (t == null) {
-            if (now - lastSeenAt > 700) {
+            if (now - lastSeenAt > 550) {
                 cancelCountdown()
                 target = null
+                smoothRect = null
                 if (phase != AimPhase.SHOT) phase = AimPhase.SEARCHING
             }
             publish(objs)
             return
         }
 
-        target = t
+        // Плавная EMA-интерполяция рамки, чтобы кольцо фокуса двигалось мягко как в GCam
+        val sr = smoothRect
+        val nextRect = if (sr == null) {
+            RectF(t.rect)
+        } else {
+            val a = 0.35f
+            RectF(
+                sr.left + a * (t.rect.left - sr.left),
+                sr.top + a * (t.rect.top - sr.top),
+                sr.right + a * (t.rect.right - sr.right),
+                sr.bottom + a * (t.rect.bottom - sr.bottom),
+            )
+        }
+        smoothRect = nextRect
+        val smoothedTarget = t.copy(rect = nextRect)
+        target = smoothedTarget
         lastSeenAt = now
-        val c = PointF(t.rect.centerX(), t.rect.centerY())
+
+        val c = PointF(nextRect.centerX(), nextRect.centerY())
         val moved = lastCenter?.let { dist(it, c) } ?: 1f
         lastCenter = c
-        if (moved > 0.02f) stableSince = now
-        val stable = now - stableSince > 500
+        if (moved > 0.025f) stableSince = now
+        val stable = now - stableSince > 450
 
-        // Перефокусировка, если объект заметно сместился.
-        if (!focusInFlight && now >= nextFocusAt && (focusedAt == null || dist(focusedAt!!, c) > 0.08f)) {
+        // Перефокусировка без рывков (не чаще раза в 1.1 с и только при заметном смещении цели)
+        if (!focusInFlight && now >= nextFocusAt && (focusedAt == null || dist(focusedAt!!, c) > 0.11f)) {
             focusInFlight = true
             focusOk = false
             val at = PointF(c.x, c.y)
             focus(at) { ok ->
                 focusInFlight = false
+                nextFocusAt = SystemClock.elapsedRealtime() + 1100
                 if (ok) {
                     focusOk = true
                     focusFails = 0
                     focusedAt = at
                 } else {
                     focusFails++
-                    // В темноте AF может «не подтверждаться» — после пары попыток доверяем тому, что есть.
-                    if (focusFails >= 3) {
+                    if (focusFails >= 2) {
                         focusOk = true
                         focusedAt = at
-                    } else {
-                        nextFocusAt = SystemClock.elapsedRealtime() + 800
                     }
                 }
             }
         }
 
         if (!armed && shotCenter != null && dist(shotCenter!!, c) > 0.15f) armed = true
-        if (countdownJob != null && moved > 0.06f) cancelCountdown()
+        if (countdownJob != null && (!autoShootEnabled || moved > 0.07f)) cancelCountdown()
 
         if (countdownJob == null && phase != AimPhase.SHOT) {
-            phase = when {
-                !focusOk -> AimPhase.FOCUSING
-                else -> AimPhase.READY
-            }
+            phase = if (!focusOk) AimPhase.FOCUSING else AimPhase.READY
         }
-        if (armed && focusOk && stable && countdownJob == null && phase != AimPhase.SHOT) startCountdown(c)
+        if (autoShootEnabled && armed && focusOk && stable && countdownJob == null && phase != AimPhase.SHOT) {
+            startCountdown(c)
+        }
         publish(objs)
     }
 
     private fun onNewTarget() {
         cancelCountdown()
+        smoothRect = null
         focusedAt = null
         focusOk = false
         focusFails = 0
@@ -176,7 +199,7 @@ class AimController(
             phase = AimPhase.SHOT
             _ui.value = _ui.value.copy(phase = AimPhase.SHOT, countdown = 0)
             countdownJob = null
-            delay(1200)
+            delay(1000)
             phase = if (target == null) AimPhase.SEARCHING else AimPhase.READY
             _ui.value = _ui.value.copy(phase = phase)
         }
@@ -199,13 +222,12 @@ class AimController(
         )
     }
 
-    /** Самый «главный» объект: крупный и ближе к центру. */
     private fun pickBest(objs: List<TrackedObj>): TrackedObj? = objs
-        .filter { it.rect.width() > 0.05f && it.rect.height() > 0.05f }
+        .filter { it.rect.width() in 0.06f..0.85f && it.rect.height() in 0.06f..0.85f }
         .maxByOrNull { o ->
-            val area = o.rect.width().coerceAtMost(1f) * o.rect.height().coerceAtMost(1f)
+            val area = o.rect.width() * o.rect.height()
             val centerDist = hypot(o.rect.centerX() - 0.5f, o.rect.centerY() - 0.5f)
-            area * (1.2f - centerDist)
+            area * (1.35f - centerDist)
         }
 
     private fun dist(a: PointF, b: PointF) = hypot(a.x - b.x, a.y - b.y)

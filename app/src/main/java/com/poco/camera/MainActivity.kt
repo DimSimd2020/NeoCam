@@ -37,19 +37,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
 import com.poco.camera.camera.CamMode
-import com.poco.camera.camera.CameraEngine
-import com.poco.camera.camera.Feedback
 import com.poco.camera.camera.SensorTracker
-import com.poco.camera.data.GalleryRepository
-import com.poco.camera.data.SettingsStore
 import com.poco.camera.ui.CameraScreen
 import com.poco.camera.ui.VolumeKey
 import com.poco.camera.ui.theme.NeoCamLogo
@@ -60,10 +54,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 
 class MainActivity : ComponentActivity() {
-    private lateinit var settingsStore: SettingsStore
-    private lateinit var engine: CameraEngine
-    private lateinit var gallery: GalleryRepository
-    private lateinit var feedback: Feedback
+    private val app: PocoApp by lazy { application as PocoApp }
     private lateinit var sensorTracker: SensorTracker
 
     private val _volumeKeys = MutableSharedFlow<VolumeKey>(extraBufferCapacity = 8)
@@ -80,12 +71,7 @@ class MainActivity : ComponentActivity() {
         setShowWhenLocked(true)
         setTurnScreenOn(true)
 
-        settingsStore = SettingsStore(applicationContext)
-        engine = CameraEngine(applicationContext)
-        gallery = GalleryRepository(applicationContext, lifecycleScope)
-        feedback = Feedback(applicationContext) { settingsStore.state.value }
-        sensorTracker = SensorTracker(applicationContext) { rot -> engine.setTargetRotation(rot) }
-
+        sensorTracker = SensorTracker(applicationContext) { rot -> app.engine.setTargetRotation(rot) }
         hasCameraPermission = checkCameraGranted()
 
         setContent {
@@ -95,7 +81,7 @@ class MainActivity : ComponentActivity() {
                 ) {
                     hasCameraPermission = checkCameraGranted()
                     if (hasCameraPermission) {
-                        gallery.refresh()
+                        app.gallery.refresh()
                     }
                 }
 
@@ -107,17 +93,17 @@ class MainActivity : ComponentActivity() {
 
                 LaunchedEffect(hasCameraPermission) {
                     if (hasCameraPermission) {
-                        engine.init()
+                        app.engine.init()
                         applyLaunchIntent(intent)
                     }
                 }
 
                 if (hasCameraPermission) {
                     CameraScreen(
-                        engine = engine,
-                        settingsStore = settingsStore,
-                        gallery = gallery,
-                        feedback = feedback,
+                        engine = app.engine,
+                        settingsStore = app.settingsStore,
+                        gallery = app.gallery,
+                        feedback = app.feedback,
                         sensorTracker = sensorTracker,
                         volumeKeys = _volumeKeys.asSharedFlow(),
                     )
@@ -150,8 +136,8 @@ class MainActivity : ComponentActivity() {
 
     private fun applyLaunchIntent(intent: Intent?) {
         when (intent?.action) {
-            MediaStore.INTENT_ACTION_VIDEO_CAMERA -> engine.setMode(CamMode.VIDEO)
-            MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA -> engine.setMode(CamMode.PHOTO)
+            MediaStore.INTENT_ACTION_VIDEO_CAMERA -> app.engine.setMode(CamMode.VIDEO)
+            MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA -> app.engine.setMode(CamMode.PHOTO)
         }
     }
 
@@ -181,9 +167,6 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         sensorTracker.stop()
-        gallery.stopObserving()
-        feedback.release()
-        engine.shutdown()
     }
 
     private fun checkCameraGranted(): Boolean =
@@ -223,7 +206,7 @@ private fun PermissionOnboarding(
                 .glass(RoundedCornerShape(28.dp), strong = true)
                 .padding(horizontal = 24.dp, vertical = 32.dp),
         ) {
-            NeoCamLogo(size = 78.dp)
+            NeoCamLogo(size = 72.dp)
             Spacer(Modifier.height(18.dp))
             Text(
                 text = "NeoCam",
@@ -231,17 +214,9 @@ private fun PermissionOnboarding(
                 color = Pc.Text,
                 textAlign = TextAlign.Center,
             )
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(8.dp))
             Text(
-                text = "by DimSimd",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                color = Pc.Accent,
-                textAlign = TextAlign.Center,
-            )
-            Spacer(Modifier.height(10.dp))
-            Text(
-                text = "Мгновенная съёмка 0 мс (Zero-Lag), 200 МП, 100x Space Zoom (S25 Ultra), режим FlexCam 90° (Z Flip 7) и ИИ-аимбот.",
+                text = "Для съёмки фото и видео необходим доступ к камере и микрофону.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = Pc.TextDim,
                 textAlign = TextAlign.Center,

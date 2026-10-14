@@ -293,7 +293,7 @@ private fun GalleryGridContent(
                 Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "К камере", tint = Pc.Text)
             }
             Text(
-                text = "Галерея NeoCam",
+                text = "Галерея",
                 style = MaterialTheme.typography.titleMedium,
                 color = Pc.Text,
                 modifier = Modifier.weight(1f).padding(start = 4.dp),
@@ -330,13 +330,13 @@ private fun GalleryGridContent(
                 .padding(horizontal = 16.dp, vertical = 6.dp),
         ) {
             GalleryTabChip(
-                text = "Альбом NeoCam ($albumCount)",
+                text = "Камера ($albumCount)",
                 selected = tab == 0,
                 onClick = { onSelectTab(0) },
                 modifier = Modifier.weight(1f),
             )
             GalleryTabChip(
-                text = "Все медиа ($allCount)",
+                text = "Все ($allCount)",
                 selected = tab == 1,
                 onClick = { onSelectTab(1) },
                 modifier = Modifier.weight(1f),
@@ -359,15 +359,9 @@ private fun GalleryGridContent(
                     )
                     Spacer(Modifier.height(12.dp))
                     Text(
-                        text = if (tab == 0) "Пока нет снимков" else "Медиафайлы не найдены",
+                        text = "Нет фото и видео",
                         color = Pc.Text,
                         style = MaterialTheme.typography.titleMedium,
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = "Нажмите на затвор в камере — кадр откроется мгновенно без ожидания сохранения",
-                        color = Pc.TextDim,
-                        style = MaterialTheme.typography.bodyMedium,
                     )
                 }
             }
@@ -531,12 +525,8 @@ private fun FullScreenViewer(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = if (currentItem.uri == Uri.EMPTY) {
-                            "Мгновенный просмотр (сохранение Ultra-JPEG…)"
-                        } else {
-                            "${pagerState.currentPage + 1} из ${items.size}"
-                        },
-                        color = if (currentItem.uri == Uri.EMPTY) Pc.Accent else Pc.TextDim,
+                        text = "${pagerState.currentPage + 1} / ${items.size}",
+                        color = Pc.TextDim,
                         fontSize = 11.sp,
                     )
                 }

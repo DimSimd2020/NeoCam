@@ -18,7 +18,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -27,14 +26,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Bolt
-import androidx.compose.material.icons.outlined.CenterFocusStrong
+import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.FlashAuto
 import androidx.compose.material.icons.outlined.FlashOff
 import androidx.compose.material.icons.outlined.FlashOn
 import androidx.compose.material.icons.outlined.FlashlightOn
 import androidx.compose.material.icons.outlined.Refresh
-import androidx.compose.material.icons.outlined.ScreenRotationAlt
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Timer
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -71,11 +68,9 @@ import com.poco.camera.camera.ProValues
 import com.poco.camera.camera.WbPreset
 import com.poco.camera.data.Aspect
 import com.poco.camera.data.CamSettings
-import com.poco.camera.data.DeviceProfile
 import com.poco.camera.data.FlashSetting
 import com.poco.camera.data.VideoRes
 import com.poco.camera.data.VolumeAction
-import com.poco.camera.ui.theme.NeoCamLogo
 import com.poco.camera.ui.theme.Pc
 import com.poco.camera.ui.theme.glass
 import java.util.Locale
@@ -85,27 +80,24 @@ import kotlin.math.ln
 import kotlin.math.roundToInt
 
 /**
- * Верхняя стеклянная панель быстрых переключателей.
+ * Лаконичная верхняя панель в стиле GCam (только иконки и краткие значения).
  */
 @Composable
 fun TopControlBar(
     state: EngineState,
     settings: CamSettings,
-    flexActive: Boolean,
     uiRotation: Float,
     onCycleFlash: () -> Unit,
     onToggleTorch: () -> Unit,
-    onToggleAim: () -> Unit,
-    onToggleFlex: () -> Unit,
+    onTogglePeaking: () -> Unit,
     onCycleAspect: () -> Unit,
-    onToggleHighRes: () -> Unit,
     onCycleVideoRes: () -> Unit,
     onToggleFps60: () -> Unit,
     onCycleTimer: () -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val rot by animateFloatAsState(targetValue = uiRotation, animationSpec = tween(250), label = "topRot")
+    val rot by animateFloatAsState(targetValue = uiRotation, animationSpec = tween(220), label = "topRot")
     val isVideo = state.mode == CamMode.VIDEO
 
     Row(
@@ -114,9 +106,9 @@ fun TopControlBar(
         modifier = modifier
             .fillMaxWidth()
             .glass(CircleShape, strong = true)
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .padding(horizontal = 10.dp, vertical = 4.dp),
     ) {
-        // Вспышка и фонарик
+        // Вспышка / Фонарик
         if (state.hasFlash) {
             if (isVideo || state.mode == CamMode.NIGHT) {
                 IconButton(
@@ -127,130 +119,87 @@ fun TopControlBar(
                         imageVector = if (state.torch) Icons.Outlined.FlashlightOn else Icons.Outlined.FlashOff,
                         contentDescription = "Фонарик",
                         tint = if (state.torch) Pc.Accent else Pc.Text,
-                        modifier = Modifier.size(19.dp),
+                        modifier = Modifier.size(20.dp),
                     )
                 }
             } else {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(
-                        onClick = onCycleFlash,
-                        modifier = Modifier.size(36.dp).rotate(rot),
-                    ) {
-                        val icon = when (settings.flash) {
-                            FlashSetting.OFF -> Icons.Outlined.FlashOff
-                            FlashSetting.AUTO -> Icons.Outlined.FlashAuto
-                            FlashSetting.ON -> Icons.Outlined.FlashOn
-                        }
-                        val active = settings.flash != FlashSetting.OFF
-                        Icon(
-                            imageVector = icon,
-                            contentDescription = "Вспышка",
-                            tint = if (active) Pc.Accent else Pc.Text,
-                            modifier = Modifier.size(19.dp),
-                        )
+                IconButton(
+                    onClick = onCycleFlash,
+                    modifier = Modifier.size(36.dp).rotate(rot),
+                ) {
+                    val icon = when (settings.flash) {
+                        FlashSetting.OFF -> Icons.Outlined.FlashOff
+                        FlashSetting.AUTO -> Icons.Outlined.FlashAuto
+                        FlashSetting.ON -> Icons.Outlined.FlashOn
                     }
-                    IconButton(
-                        onClick = onToggleTorch,
-                        modifier = Modifier.size(32.dp).rotate(rot),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.FlashlightOn,
-                            contentDescription = "Фонарик",
-                            tint = if (state.torch) Pc.Accent else Pc.TextDim,
-                            modifier = Modifier.size(17.dp),
-                        )
-                    }
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = "Вспышка",
+                        tint = if (settings.flash != FlashSetting.OFF) Pc.Accent else Pc.Text,
+                        modifier = Modifier.size(20.dp),
+                    )
                 }
             }
         }
 
-        // Для Samsung Galaxy Z Flip 7 — быстрая кнопка FlexCam (режим сложенного экрана 90°)
-        if (settings.profile.supportsFlexCam) {
-            TopPillButton(
-                text = "FLEX",
-                active = flexActive,
-                onClick = onToggleFlex,
-                leading = {
-                    Icon(
-                        imageVector = Icons.Outlined.ScreenRotationAlt,
-                        contentDescription = null,
-                        tint = if (flexActive) Pc.OnAccent else Pc.Text,
-                        modifier = Modifier.size(14.dp),
-                    )
-                },
-            )
-        }
-
-        // Кнопка «Аимбот» для фото-режимов
-        if (state.mode.isPhotoLike) {
-            TopPillButton(
-                text = "АИМ",
-                active = settings.aim,
-                onClick = onToggleAim,
-                leading = {
-                    Icon(
-                        imageVector = Icons.Outlined.CenterFocusStrong,
-                        contentDescription = null,
-                        tint = if (settings.aim) Pc.OnAccent else Pc.Text,
-                        modifier = Modifier.size(14.dp),
-                    )
-                },
-            )
-        }
-
-        // Разрешение видео + 60fps ИЛИ формат кадра + 200MP/50MP
         if (isVideo) {
-            TopPillButton(
+            TopCompactPill(
                 text = settings.videoRes.label,
                 active = settings.videoRes == VideoRes.UHD,
                 onClick = onCycleVideoRes,
             )
             if (state.fps60Supported) {
-                TopPillButton(
-                    text = if (settings.fps60) "60 FPS" else "30 FPS",
+                TopCompactPill(
+                    text = if (settings.fps60) "60" else "30",
                     active = settings.fps60,
                     onClick = onToggleFps60,
                 )
             }
         } else {
-            TopPillButton(
-                text = settings.aspect.label,
-                active = false,
-                onClick = onCycleAspect,
-            )
-            val mp = state.highResMp
-            if (mp != null && (state.mode == CamMode.PHOTO || state.mode == CamMode.PRO)) {
-                TopPillButton(
-                    text = if (settings.highRes) "${mp}MP" else "12MP",
-                    active = settings.highRes,
-                    onClick = onToggleHighRes,
-                )
-            }
             // Таймер
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .clip(CircleShape)
-                    .background(if (settings.timer > 0) Pc.Accent.copy(alpha = 0.2f) else Color.Transparent)
                     .clickable(onClick = onCycleTimer)
-                    .padding(horizontal = 7.dp, vertical = 5.dp),
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
             ) {
                 Icon(
                     imageVector = Icons.Outlined.Timer,
                     contentDescription = "Таймер",
                     tint = if (settings.timer > 0) Pc.Accent else Pc.Text,
-                    modifier = Modifier.size(17.dp).rotate(rot),
+                    modifier = Modifier.size(19.dp).rotate(rot),
                 )
                 if (settings.timer > 0) {
-                    Spacer(Modifier.width(2.dp))
+                    Spacer(Modifier.width(3.dp))
                     Text(
                         text = "${settings.timer}с",
                         color = Pc.Accent,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
                     )
                 }
             }
+
+            // Подсветка резких контуров фокуса (Focus Peaking)
+            IconButton(
+                onClick = onTogglePeaking,
+                modifier = Modifier.size(36.dp).rotate(rot),
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.AutoAwesome,
+                    contentDescription = "Контуры фокуса",
+                    tint = if (settings.focusPeaking) Pc.Accent else Pc.TextDim,
+                    modifier = Modifier.size(19.dp),
+                )
+            }
+
+            // Формат кадра
+            TopCompactPill(
+                text = settings.aspect.label,
+                active = false,
+                onClick = onCycleAspect,
+            )
         }
 
         // Настройки
@@ -262,81 +211,58 @@ fun TopControlBar(
                 imageVector = Icons.Outlined.Settings,
                 contentDescription = "Настройки",
                 tint = Pc.Text,
-                modifier = Modifier.size(19.dp),
+                modifier = Modifier.size(20.dp),
             )
         }
     }
 }
 
 @Composable
-private fun TopPillButton(
+private fun TopCompactPill(
     text: String,
     active: Boolean,
     onClick: () -> Unit,
-    leading: (@Composable () -> Unit)? = null,
 ) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
+    Box(
+        contentAlignment = Alignment.Center,
         modifier = Modifier
             .clip(CircleShape)
-            .let {
-                if (active) {
-                    it.background(Pc.AccentBrush).border(1.dp, Pc.Accent, CircleShape)
-                } else {
-                    it.background(Color(0x220055FF)).border(0.8.dp, Pc.GlassStroke, CircleShape)
-                }
-            }
+            .background(if (active) Pc.Accent.copy(alpha = 0.2f) else Color(0x1AFFFFFF))
+            .border(1.dp, if (active) Pc.Accent else Color.Transparent, CircleShape)
             .clickable(onClick = onClick)
-            .padding(horizontal = 9.dp, vertical = 5.dp),
+            .padding(horizontal = 11.dp, vertical = 5.dp),
     ) {
-        if (leading != null) {
-            leading()
-            Spacer(Modifier.width(4.dp))
-        }
         Text(
             text = text,
-            color = if (active) Pc.Text else Pc.Text,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Bold,
+            color = if (active) Pc.Accent else Pc.Text,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
         )
     }
 }
 
 /**
- * Панель зума: пресеты под S25 Ultra (0.6 / 1 / 2 / 3 / 5 / 10 / 30 / 100x), Z Flip 7 и Poco X8 Pro + плавный скраббинг.
+ * Круглые кнопки зума в стиле GCam (.5, 1x, 2, 5) с плавным свайп-зумом.
  */
 @Composable
 fun ZoomBar(
     zoom: Float,
     minZoom: Float,
     maxZoom: Float,
-    hwMaxZoom: Float,
-    profile: DeviceProfile,
-    lenses: List<Lens>,
+    stops: List<Float>,
     onZoomChange: (Float) -> Unit,
     onStepTick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var showFineSlider by remember { mutableStateOf(false) }
 
-    val stops = remember(minZoom, maxZoom, profile, lenses) {
-        val raw = when (profile) {
-            DeviceProfile.PIXEL_8 -> listOf(minZoom.coerceAtMost(0.6f), 1f, 2f, 5f, 8f, 15f, 30f)
-            DeviceProfile.S25_ULTRA -> listOf(0.6f, 1f, 2f, 3f, 5f, 10f, 30f, 100f)
-            DeviceProfile.Z_FLIP_7 -> listOf(0.6f, 1f, 2f, 4f, 10f, 30f)
-            DeviceProfile.POCO_X8_PRO -> listOf(0.6f, 1f, 2f, 5f, 10f, 30f)
-        }
-        raw.filter { s ->
-            (s >= minZoom - 0.05f || (s < 1f && minZoom < 0.95f)) && s <= maxZoom + 0.1f
-        }.map { it.coerceIn(minZoom, maxZoom) }.distinctBy { (it * 10f).roundToInt() }
-    }
-
-    val activeStopIdx = stops.indices.minByOrNull { i ->
-        val next = stops.getOrNull(i + 1)
-        val prev = stops.getOrNull(i - 1)
-        val s = stops[i]
+    val safeStops = if (stops.isEmpty()) listOf(1f, 2f) else stops
+    val activeStopIdx = safeStops.indices.minByOrNull { i ->
+        val next = safeStops.getOrNull(i + 1)
+        val prev = safeStops.getOrNull(i - 1)
+        val s = safeStops[i]
         when {
-            abs(zoom - s) < 0.08f -> 0f
+            abs(zoom - s) < 0.07f -> 0f
             next != null && zoom in s..next -> abs(ln(zoom / s))
             prev != null && zoom in prev..s -> abs(ln(zoom / s))
             else -> abs(ln(zoom / s)) + 10f
@@ -347,32 +273,6 @@ fun ZoomBar(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = modifier.fillMaxWidth(),
     ) {
-        // Индикатор Super Res Zoom / Space Zoom / Супер-зума
-        AnimatedVisibility(
-            visible = zoom > hwMaxZoom + 0.08f || (profile == DeviceProfile.PIXEL_8 && zoom >= 2f),
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically(),
-        ) {
-            val label = when {
-                profile == DeviceProfile.PIXEL_8 && zoom >= 8f -> String.format(Locale.US, "SUPER RES ZOOM %.1fx", zoom)
-                profile == DeviceProfile.PIXEL_8 && zoom >= 2f -> String.format(Locale.US, "SUPER RES %.1fx", zoom)
-                profile == DeviceProfile.S25_ULTRA && zoom >= 30f -> String.format(Locale.US, "SPACE ZOOM %.0fx", zoom)
-                else -> String.format(Locale.US, "СУПЕР-ЗУМ %.1fx", zoom)
-            }
-            Text(
-                text = label,
-                color = Pc.Accent,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier
-                    .padding(bottom = 5.dp)
-                    .glass(CircleShape, strong = true)
-                    .border(1.dp, Pc.Accent.copy(alpha = 0.65f), CircleShape)
-                    .padding(horizontal = 10.dp, vertical = 3.dp),
-            )
-        }
-
-        // Тонкая логарифмическая шкала зума
         AnimatedVisibility(
             visible = showFineSlider,
             enter = fadeIn() + expandVertically(),
@@ -385,7 +285,7 @@ fun ZoomBar(
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
-                    .padding(bottom = 6.dp, start = 20.dp, end = 20.dp)
+                    .padding(bottom = 8.dp, start = 28.dp, end = 28.dp)
                     .fillMaxWidth()
                     .glass(CircleShape, strong = true)
                     .padding(horizontal = 14.dp, vertical = 2.dp),
@@ -410,10 +310,10 @@ fun ZoomBar(
             }
         }
 
-        // Кнопки пресетов зума
+        // GCam пилюля с круглыми кнопками кратности
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier
                 .glass(CircleShape, strong = true)
                 .pointerInput(minZoom, maxZoom) {
@@ -425,7 +325,7 @@ fun ZoomBar(
                         },
                         onHorizontalDrag = { change, dragAmount ->
                             change.consume()
-                            val factor = exp(dragAmount / 210f)
+                            val factor = exp(dragAmount / 220f)
                             val prevInt = dragZoom.toInt()
                             dragZoom = (dragZoom * factor).coerceIn(minZoom, maxZoom)
                             if (dragZoom.toInt() != prevInt) onStepTick()
@@ -435,7 +335,7 @@ fun ZoomBar(
                 }
                 .padding(horizontal = 6.dp, vertical = 4.dp),
         ) {
-            stops.forEachIndexed { idx, stop ->
+            safeStops.forEachIndexed { idx, stop ->
                 val isSelected = idx == activeStopIdx
                 val displayVal = if (isSelected) zoom else stop
                 val label = formatZoomLabel(displayVal, selected = isSelected)
@@ -443,15 +343,14 @@ fun ZoomBar(
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
-                        .height(31.dp)
+                        .size(if (isSelected) 38.dp else 32.dp)
                         .clip(CircleShape)
-                        .let {
-                            if (isSelected) {
-                                it.background(Pc.AccentBrush).border(1.dp, Pc.Accent, CircleShape)
-                            } else {
-                                it
-                            }
-                        }
+                        .background(if (isSelected) Pc.SurfaceHi else Color.Transparent)
+                        .border(
+                            width = if (isSelected) 1.5.dp else 0.dp,
+                            color = if (isSelected) Pc.Accent else Color.Transparent,
+                            shape = CircleShape,
+                        )
                         .clickable {
                             if (isSelected && abs(zoom - stop) < 0.05f) {
                                 showFineSlider = !showFineSlider
@@ -459,13 +358,12 @@ fun ZoomBar(
                                 onStepTick()
                                 onZoomChange(stop)
                             }
-                        }
-                        .padding(horizontal = if (isSelected) 11.dp else 8.dp),
+                        },
                 ) {
                     Text(
                         text = label,
-                        color = if (isSelected) Pc.Text else Pc.TextDim,
-                        fontSize = 11.sp,
+                        color = if (isSelected) Pc.Accent else Pc.Text,
+                        fontSize = if (isSelected) 11.sp else 11.sp,
                         fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
                     )
                 }
@@ -475,8 +373,8 @@ fun ZoomBar(
 }
 
 private fun formatZoomLabel(z: Float, selected: Boolean): String {
-    if (z in 0.48f..0.57f) {
-        return if (selected) "0.5x" else "0.5"
+    if (z in 0.48f..0.64f) {
+        return if (selected) ".5x" else ".5"
     }
     if (z >= 10f) {
         val r = z.roundToInt()
@@ -514,9 +412,6 @@ private val SHUTTER_PRESETS: List<Pair<String, Long>> = listOf(
     "8с" to 8_000_000_000L,
 )
 
-/**
- * Панель ручных настроек PRO-режима (Expert RAW / Pro).
- */
 @Composable
 fun ProPanel(
     pro: ProValues,
@@ -684,7 +579,6 @@ fun ProPanel(
             }
         }
 
-        // Основная полоса параметров PRO
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceEvenly,
@@ -695,7 +589,7 @@ fun ProPanel(
         ) {
             ProParamPill(
                 title = "ISO",
-                value = pro.iso?.toString() ?: live.iso.takeIf { it > 0 }?.let { "A $it" } ?: "АВТО",
+                value = pro.iso?.toString() ?: live.iso.takeIf { it > 0 }?.toString() ?: "АВТО",
                 manual = pro.iso != null,
                 selected = activeTab == ProTab.ISO,
                 onClick = { activeTab = if (activeTab == ProTab.ISO) null else ProTab.ISO },
@@ -703,7 +597,7 @@ fun ProPanel(
             ProParamPill(
                 title = "S",
                 value = pro.shutterNs?.let(::formatShutterNs)
-                    ?: live.shutterNs.takeIf { it > 0 }?.let { "A ${formatShutterNs(it)}" }
+                    ?: live.shutterNs.takeIf { it > 0 }?.let(::formatShutterNs)
                     ?: "АВТО",
                 manual = pro.shutterNs != null,
                 selected = activeTab == ProTab.SHUTTER,
@@ -717,11 +611,11 @@ fun ProPanel(
                 onClick = { activeTab = if (activeTab == ProTab.EV) null else ProTab.EV },
             )
             ProParamPill(
-                title = "FOCUS",
+                title = "AF",
                 value = when {
-                    pro.focus == null -> "AF"
-                    pro.focus < 0.08f -> "MF ∞"
-                    else -> String.format(Locale.US, "MF %.1f", pro.focus)
+                    pro.focus == null -> "АВТО"
+                    pro.focus < 0.08f -> "∞"
+                    else -> String.format(Locale.US, "%.1f", pro.focus)
                 },
                 manual = pro.focus != null,
                 selected = activeTab == ProTab.FOCUS,
@@ -745,7 +639,7 @@ fun ProPanel(
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.Refresh,
-                        contentDescription = "Сбросить PRO",
+                        contentDescription = "Сбросить",
                         tint = Pc.Accent,
                         modifier = Modifier.size(18.dp),
                     )
@@ -822,7 +716,7 @@ fun formatShutterNs(ns: Long): String {
 }
 
 /**
- * Нижняя шторка полных настроек камеры (Samsung S25 Ultra / Z Flip 7 / Poco X8 Pro).
+ * Чистая шторка настроек в стиле GCam без лишнего шума.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -846,109 +740,13 @@ fun SettingsSheet(
                 .padding(horizontal = 20.dp)
                 .padding(bottom = 32.dp),
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                NeoCamLogo(size = 46.dp)
-                Spacer(Modifier.width(12.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = "NeoCam",
-                            style = MaterialTheme.typography.titleLarge,
-                            color = Pc.Text,
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            text = "by DimSimd",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Pc.Accent,
-                            modifier = Modifier
-                                .clip(CircleShape)
-                                .background(Pc.Accent.copy(alpha = 0.14f))
-                                .border(1.dp, Pc.Accent.copy(alpha = 0.45f), CircleShape)
-                                .padding(horizontal = 8.dp, vertical = 2.dp),
-                        )
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Outlined.Bolt,
-                            contentDescription = null,
-                            tint = Pc.Accent,
-                            modifier = Modifier.size(14.dp),
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text(
-                            text = "${settings.profile.title} • ${if (state.zslActive) "Zero-Lag 0 мс" else "Ultra Engine"}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = Pc.TextDim,
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(14.dp))
-
-            // ---- Секция: Профиль флагмана ----
-            SectionHeader("ПРОФИЛЬ УСТРОЙСТВА")
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 8.dp),
-            ) {
-                DeviceProfile.entries.forEach { prof ->
-                    val isSel = settings.profile == prof
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(if (isSel) Pc.Accent else Pc.SurfaceHi)
-                            .clickable { onUpdate { it.copy(profile = prof) } }
-                            .padding(vertical = 10.dp, horizontal = 6.dp),
-                    ) {
-                        Text(
-                            text = prof.shortBadge,
-                            color = if (isSel) Pc.OnAccent else Pc.Text,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                        )
-                    }
-                }
-            }
-
-            HorizontalDivider(color = Pc.GlassStroke, modifier = Modifier.padding(vertical = 10.dp))
-
-            // ---- Секция: Скорость и Мгновенный спуск ----
-            SectionHeader("МГНОВЕННАЯ СЪЁМКА БЕЗ ЛАГОВ")
-            ToggleSettingRow(
-                title = "Мгновенный затвор (Zero-Shutter-Lag)",
-                subtitle = "Снимок делается в ту же миллисекунду при нажатии без задержки",
-                checked = settings.zeroLag,
-                onCheckedChange = { v -> onUpdate { it.copy(zeroLag = v) } },
+            Text(
+                text = "Настройки",
+                style = MaterialTheme.typography.titleLarge,
+                color = Pc.Text,
+                modifier = Modifier.padding(bottom = 14.dp),
             )
-            ToggleSettingRow(
-                title = "Мгновенное превью («Сфоткал — сразу открыл»)",
-                subtitle = "Всплывающая карточка кадра из памяти (0 мс до просмотра)",
-                checked = settings.instantReview,
-                onCheckedChange = { v -> onUpdate { it.copy(instantReview = v) } },
-            )
-            if (settings.profile.supportsFlexCam) {
-                ToggleSettingRow(
-                    title = "Режим FlexCam (Galaxy Z Flip 7)",
-                    subtitle = "Разделять экран на видоискатель сверху и пульт снизу (авто по датчику сгиба или вручную)",
-                    checked = settings.flexModeManual,
-                    onCheckedChange = { v -> onUpdate { it.copy(flexModeManual = v) } },
-                )
-            }
 
-            HorizontalDivider(color = Pc.GlassStroke, modifier = Modifier.padding(vertical = 10.dp))
-
-            // ---- Секция: Фото ----
-            SectionHeader("ФОТОСЪЁМКА")
             ChipSettingRow(
                 title = "Формат кадра",
                 options = Aspect.entries,
@@ -957,60 +755,40 @@ fun SettingsSheet(
                 onSelect = { a -> onUpdate { it.copy(aspect = a) } },
             )
             ChipSettingRow(
-                title = "Таймер затвора",
-                options = listOf(0, 3, 5, 10),
+                title = "Таймер",
+                options = listOf(0, 3, 10),
                 selected = settings.timer,
                 labelOf = { if (it == 0) "Выкл" else "${it} с" },
                 onSelect = { t -> onUpdate { it.copy(timer = t) } },
             )
             state.highResMp?.let { mp ->
                 ToggleSettingRow(
-                    title = "Ультра-разрешение сенсора (${mp} МП)",
-                    subtitle = "Максимальная детализация матрицы",
+                    title = "Полное разрешение (${mp} МП)",
                     checked = settings.highRes,
                     onCheckedChange = { v -> onUpdate { it.copy(highRes = v) } },
                 )
             }
             ToggleSettingRow(
-                title = "Зеркальное селфи",
-                subtitle = "Сохранять фронтальные фото как в превью",
-                checked = settings.mirrorFront,
-                onCheckedChange = { v -> onUpdate { it.copy(mirrorFront = v) } },
+                title = "Подсветка резкости краёв (Focus Peaking)",
+                checked = settings.focusPeaking,
+                onCheckedChange = { v -> onUpdate { it.copy(focusPeaking = v) } },
+            )
+            ToggleSettingRow(
+                title = "Следящий автофокус по объекту",
+                checked = settings.autoTrack,
+                onCheckedChange = { v -> onUpdate { it.copy(autoTrack = v) } },
+            )
+            ToggleSettingRow(
+                title = "Автоспуск при наведении на объект",
+                checked = settings.autoShoot,
+                onCheckedChange = { v -> onUpdate { it.copy(autoShoot = v) } },
             )
 
             HorizontalDivider(color = Pc.GlassStroke, modifier = Modifier.padding(vertical = 10.dp))
 
-            // ---- Секция: ИИ и Аимбот ----
-            SectionHeader("УМНЫЙ АИМБОТ И ИИ")
-            ToggleSettingRow(
-                title = "Аимбот (автозахват и автоспуск)",
-                subtitle = "Держит цель в фокусе и сам делает кадр при стабилизации",
-                checked = settings.aim,
-                onCheckedChange = { v -> onUpdate { it.copy(aim = v) } },
-            )
-            if (settings.aim) {
-                ChipSettingRow(
-                    title = "Отсчёт автоспуска аимбота",
-                    options = listOf(1, 2, 3, 5),
-                    selected = settings.aimDelay,
-                    labelOf = { "${it} с" },
-                    onSelect = { d -> onUpdate { it.copy(aimDelay = d) } },
-                )
-            }
-            ToggleSettingRow(
-                title = "Автораспознавание QR-кодов",
-                subtitle = "Мгновенно сканировать ссылки и текст в кадре",
-                checked = settings.qr,
-                onCheckedChange = { v -> onUpdate { it.copy(qr = v) } },
-            )
-
-            HorizontalDivider(color = Pc.GlassStroke, modifier = Modifier.padding(vertical = 10.dp))
-
-            // ---- Секция: Видео ----
-            SectionHeader("ВИДЕОСЪЁМКА")
             val qualities = state.videoQualities.ifEmpty { VideoRes.entries }
             ChipSettingRow(
-                title = "Разрешение видео",
+                title = "Качество видео",
                 options = qualities,
                 selected = settings.videoRes,
                 labelOf = { it.label },
@@ -1018,16 +796,14 @@ fun SettingsSheet(
             )
             if (state.fps60Supported) {
                 ToggleSettingRow(
-                    title = "Плавная съёмка 60 FPS",
-                    subtitle = "Повышенная частота кадров для динамичных сцен",
+                    title = "60 кадров/с",
                     checked = settings.fps60,
                     onCheckedChange = { v -> onUpdate { it.copy(fps60 = v) } },
                 )
             }
             if (state.stabilizationSupported) {
                 ToggleSettingRow(
-                    title = "Супер-стабилизация видео (OIS + VDIS)",
-                    subtitle = "Компенсация тряски рук при видеозаписи",
+                    title = "Стабилизация видео",
                     checked = settings.stabilization,
                     onCheckedChange = { v -> onUpdate { it.copy(stabilization = v) } },
                 )
@@ -1035,19 +811,25 @@ fun SettingsSheet(
 
             HorizontalDivider(color = Pc.GlassStroke, modifier = Modifier.padding(vertical = 10.dp))
 
-            // ---- Секция: Видоискатель и система ----
-            SectionHeader("ВИДОИСКАТЕЛЬ И УПРАВЛЕНИЕ")
             ToggleSettingRow(
-                title = "Сетка композиции 3×3",
-                subtitle = "Линии правила третей на экране",
+                title = "Сетка 3×3",
                 checked = settings.grid,
                 onCheckedChange = { v -> onUpdate { it.copy(grid = v) } },
             )
             ToggleSettingRow(
-                title = "Электронный уровень горизонта",
-                subtitle = "Индикатор наклона с тактильной фиксацией 0°",
+                title = "Уровень горизонта",
                 checked = settings.level,
                 onCheckedChange = { v -> onUpdate { it.copy(level = v) } },
+            )
+            ToggleSettingRow(
+                title = "Сканер QR-кодов",
+                checked = settings.qr,
+                onCheckedChange = { v -> onUpdate { it.copy(qr = v) } },
+            )
+            ToggleSettingRow(
+                title = "Зеркальное селфи",
+                checked = settings.mirrorFront,
+                onCheckedChange = { v -> onUpdate { it.copy(mirrorFront = v) } },
             )
             ChipSettingRow(
                 title = "Кнопки громкости",
@@ -1057,44 +839,22 @@ fun SettingsSheet(
                 onSelect = { a -> onUpdate { it.copy(volume = a) } },
             )
             ToggleSettingRow(
-                title = "Звук затвора и таймера",
-                subtitle = "Звуковое подтверждение снимка и отсчёта",
+                title = "Звуки камеры",
                 checked = settings.shutterSound,
                 onCheckedChange = { v -> onUpdate { it.copy(shutterSound = v) } },
             )
             ToggleSettingRow(
-                title = "Тактильный виброотклик",
-                subtitle = "Чёткая вибрация при переключении режимов и зума",
+                title = "Виброотклик",
                 checked = settings.haptics,
                 onCheckedChange = { v -> onUpdate { it.copy(haptics = v) } },
-            )
-
-            Spacer(Modifier.height(16.dp))
-            Text(
-                text = "NeoCam v2.0 • Author: DimSimd",
-                color = Pc.TextDim,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier.align(Alignment.CenterHorizontally),
             )
         }
     }
 }
 
 @Composable
-private fun SectionHeader(title: String) {
-    Text(
-        text = title,
-        color = Pc.Accent,
-        style = MaterialTheme.typography.labelLarge,
-        modifier = Modifier.padding(bottom = 8.dp),
-    )
-}
-
-@Composable
 private fun ToggleSettingRow(
     title: String,
-    subtitle: String,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
 ) {
@@ -1104,12 +864,15 @@ private fun ToggleSettingRow(
             .fillMaxWidth()
             .clip(RoundedCornerShape(14.dp))
             .clickable { onCheckedChange(!checked) }
-            .padding(vertical = 8.dp),
+            .padding(vertical = 9.dp),
     ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(text = title, color = Pc.Text, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-            Text(text = subtitle, color = Pc.TextDim, fontSize = 12.sp)
-        }
+        Text(
+            text = title,
+            color = Pc.Text,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.weight(1f).padding(end = 12.dp),
+        )
         Switch(
             checked = checked,
             onCheckedChange = onCheckedChange,
@@ -1154,7 +917,7 @@ private fun <T> ChipSettingRow(
                         .clip(CircleShape)
                         .background(if (isSel) Pc.Accent else Pc.SurfaceHi)
                         .clickable { onSelect(opt) }
-                        .padding(horizontal = 11.dp, vertical = 6.dp),
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
                 ) {
                     Text(
                         text = labelOf(opt),

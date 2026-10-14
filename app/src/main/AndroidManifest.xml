@@ -25,7 +25,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:screenOrientation="portrait"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
+            android:configChanges="keyboard|keyboardHidden|navigation|touchscreen|colorMode|fontScale|layoutDirection|locale|mcc|mnc|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|density"
             android:launchMode="singleTask"
             android:theme="@style/Theme.PocoCam">
             <intent-filter>
