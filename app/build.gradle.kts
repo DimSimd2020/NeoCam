@@ -20,13 +20,29 @@ android {
         resValue("string", "app_name", "NeoCam")
     }
 
+    signingConfigs {
+        val persistentKey = System.getenv("NEOCAM_KEYSTORE_PATH")
+        if (!persistentKey.isNullOrBlank()) {
+            create("persistentRelease") {
+                storeFile = file(persistentKey)
+                storePassword = System.getenv("NEOCAM_STORE_PASSWORD")
+                keyAlias = System.getenv("NEOCAM_KEY_ALIAS")
+                keyPassword = System.getenv("NEOCAM_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Подписываем debug-ключом, чтобы APK можно было сразу поставить на телефон.
-            signingConfig = signingConfigs.getByName("debug")
+            // A persistent production key is required for in-place Android updates.
+            signingConfig = if (!System.getenv("NEOCAM_KEYSTORE_PATH").isNullOrBlank()) {
+                signingConfigs.getByName("persistentRelease")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
     compileOptions {

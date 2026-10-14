@@ -20,6 +20,10 @@ jobs:
   release:
     name: Build, verify, and publish APK
     runs-on: ubuntu-latest
+    env:
+      NEOCAM_STORE_PASSWORD: ${{ secrets.NEOCAM_STORE_PASSWORD }}
+      NEOCAM_KEY_ALIAS: ${{ secrets.NEOCAM_KEY_ALIAS }}
+      NEOCAM_KEY_PASSWORD: ${{ secrets.NEOCAM_KEY_PASSWORD }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -40,6 +44,18 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+
+      - name: Restore persistent signing key (optional)
+        env:
+          KEYSTORE_B64: ${{ secrets.NEOCAM_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$KEYSTORE_B64" && -n "$NEOCAM_STORE_PASSWORD" && -n "$NEOCAM_KEY_ALIAS" && -n "$NEOCAM_KEY_PASSWORD" ]]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/neocam-release.jks"
+            echo "NEOCAM_KEYSTORE_PATH=$RUNNER_TEMP/neocam-release.jks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No persistent signing key. The generated APK cannot update previous debug-signed builds in place."
+          fi
 
       - name: Build release APK
         run: |
@@ -75,11 +91,11 @@ jobs:
           **Signing note:** The project currently configures its release build to use the Android debug signing key. This APK is therefore **debug-key-signed**, not production-key-signed; installing updates from a different key may require uninstalling the previous app first.
           EOF
           if gh release view v2.2 >/dev/null 2>&1; then
-            gh release upload v2.2 NeoCam-v2.2.apk NeoCam-v2.2.apk.sha256 --clobber
-          else
-            gh release create v2.2 NeoCam-v2.2.apk NeoCam-v2.2.apk.sha256 \
-              --target "$GITHUB_SHA" \
-              --title "NeoCam v2.2" \
-              --notes-file release-notes.md \
-              --latest
+            echo "::error::v2.2 already exists. Never silently replace published APK binaries."
+            exit 1
           fi
+          gh release create v2.2 NeoCam-v2.2.apk NeoCam-v2.2.apk.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "NeoCam v2.2" \
+            --notes-file release-notes.md \
+            --latest

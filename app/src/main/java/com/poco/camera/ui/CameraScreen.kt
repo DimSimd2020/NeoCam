@@ -3,7 +3,6 @@ package com.poco.camera.ui
 import android.Manifest
 import android.content.Intent
 import android.net.Uri
-import android.widget.Toast
 import com.poco.camera.updates.AvailableUpdate
 import com.poco.camera.updates.UpdateManager
 import android.content.pm.PackageManager

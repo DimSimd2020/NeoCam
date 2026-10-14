@@ -29,7 +29,7 @@ class UpdateManager(private val context: Context) {
     suspend fun checkForUpdate(force: Boolean = false): AvailableUpdate? = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
         val age = now - prefs.getLong("last_successful_check", 0L)
-        if (!force && age in 0 until CHECK_INTERVAL_MS) return@withContext null
+        if (!force && age in 0L until CHECK_INTERVAL_MS) return@withContext null
         val release = JSONObject(readSmallText(API_LATEST))
         check(!release.optBoolean("draft") && !release.optBoolean("prerelease")) {
             "Релиз ещё не опубликован"
