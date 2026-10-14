@@ -1,6 +1,11 @@
 package com.poco.camera.ui
 
 import android.Manifest
+import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
+import com.poco.camera.updates.AvailableUpdate
+import com.poco.camera.updates.UpdateManager
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.PointF
@@ -131,6 +136,7 @@ fun CameraScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
+    val updater = remember(context) { UpdateManager(context.applicationContext) }
 
     val state by engine.state.collectAsState()
     val settings by settingsStore.state.collectAsState()
@@ -144,6 +150,11 @@ fun CameraScreen(
     var proValues by remember { mutableStateOf(ProValues()) }
     var showSettings by remember { mutableStateOf(false) }
     var showQuickSettings by remember { mutableStateOf(false) }
+    var availableUpdate by remember { mutableStateOf<AvailableUpdate?>(null) }
+    var updateDownloading by remember { mutableStateOf(false) }
+    var updateProgress by remember { mutableIntStateOf(0) }
+    var updateError by remember { mutableStateOf<String?>(null) }
+    var checkingUpdates by remember { mutableStateOf(false) }
     var showGallery by remember { mutableStateOf(false) }
     var shutterFlash by remember { mutableStateOf(false) }
     var frontSelfieLight by remember { mutableStateOf(false) }
@@ -210,6 +221,34 @@ fun CameraScreen(
 
     LaunchedEffect(Unit) {
         engine.init()
+    }
+
+    LaunchedEffect(Unit) {
+        runCatching { updater.checkForUpdate() }.getOrNull()?.let {
+            availableUpdate = it
+        }
+    }
+
+    fun checkUpdatesManually() {
+        if (checkingUpdates) return
+        checkingUpdates = true
+        scope.launch {
+            val result = runCatching { updater.checkForUpdate(force = true) }
+            checkingUpdates = false
+            result.fold(
+                onSuccess = { update ->
+                    if (update == null) {
+                        Toast.makeText(context, "Установлена последняя версия NeoCam", Toast.LENGTH_LONG).show()
+                    } else {
+                        availableUpdate = update
+                        updateError = null
+                    }
+                },
+                onFailure = { failure ->
+                    Toast.makeText(context, "Проверка обновлений: " + failure.message, Toast.LENGTH_LONG).show()
+                },
+            )
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -813,6 +852,51 @@ fun CameraScreen(
                 settingsStore.update(block)
             },
             onDismiss = { showSettings = false },
+            onCheckUpdates = {
+                showSettings = false
+                checkUpdatesManually()
+            },
+        )
+    }
+
+    availableUpdate?.let { update ->
+        UpdateDialog(
+            update = update,
+            downloading = updateDownloading,
+            progress = updateProgress,
+            error = updateError,
+            onInstall = {
+                if (!updater.canInstallPackages()) {
+                    updater.openUnknownSourcesSettings()
+                    updateError = "Разрешите установку из NeoCam в настройках Android, затем нажмите ещё раз."
+                } else {
+                    updateDownloading = true
+                    updateError = null
+                    updateProgress = 0
+                    scope.launch {
+                        val result = runCatching {
+                            updater.downloadAndVerify(update) { percent -> updateProgress = percent }
+                        }
+                        updateDownloading = false
+                        result.fold(
+                            onSuccess = { apk ->
+                                runCatching { updater.install(apk) }
+                                    .onSuccess { availableUpdate = null }
+                                    .onFailure { failure ->
+                                        updateError = failure.message ?: "Не удалось открыть установщик Android"
+                                    }
+                            },
+                            onFailure = { failure ->
+                                updateError = failure.message ?: "Ошибка загрузки APK"
+                            },
+                        )
+                    }
+                }
+            },
+            onDismiss = { availableUpdate = null; updateError = null },
+            onOpenGitHub = {
+                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(update.releaseUrl)))
+            },
         )
     }
 }

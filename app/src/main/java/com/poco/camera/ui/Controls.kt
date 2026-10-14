@@ -38,6 +38,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Slider
@@ -797,6 +798,7 @@ fun SettingsSheet(
     state: EngineState,
     onUpdate: ((CamSettings) -> CamSettings) -> Unit,
     onDismiss: () -> Unit,
+    onCheckUpdates: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
@@ -818,6 +820,9 @@ fun SettingsSheet(
                 color = Pc.Text,
                 modifier = Modifier.padding(bottom = 14.dp),
             )
+            OutlinedButton(onClick = onCheckUpdates) {
+                Text("Проверить обновления · v" + com.poco.camera.BuildConfig.VERSION_NAME)
+            }
 
             ChipSettingRow(
                 title = "Формат кадра",
