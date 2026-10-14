@@ -29,6 +29,7 @@ import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -42,12 +43,17 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Cameraswitch
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Nightlight
+import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.PlayArrow
@@ -137,6 +143,7 @@ fun CameraScreen(
 
     var proValues by remember { mutableStateOf(ProValues()) }
     var showSettings by remember { mutableStateOf(false) }
+    var showQuickSettings by remember { mutableStateOf(false) }
     var showGallery by remember { mutableStateOf(false) }
     var shutterFlash by remember { mutableStateOf(false) }
     var frontSelfieLight by remember { mutableStateOf(false) }
@@ -281,7 +288,8 @@ fun CameraScreen(
     }
 
     fun triggerPrimaryShutter() {
-        if (showGallery || showSettings) return
+        if (showGallery || showSettings || showQuickSettings) return
+        if (state.mode == CamMode.ASTRO && capturingCount > 0) return
         if (state.mode == CamMode.VIDEO) {
             if (state.recording != null) {
                 feedback.videoStop()
@@ -390,6 +398,7 @@ fun CameraScreen(
                 settings.videoRes,
                 settings.fps60,
                 settings.stabilization,
+                settings.astroExposureSec,
             ) {
                 BindConfig(
                     lensId = lensId,
@@ -399,6 +408,7 @@ fun CameraScreen(
                     videoRes = settings.videoRes,
                     fps60 = settings.fps60,
                     stabilization = settings.stabilization,
+                    astroExposureSec = settings.astroExposureSec,
                 )
             }
             LaunchedEffect(bindCfg) {
@@ -722,7 +732,7 @@ fun CameraScreen(
                 )
             }
 
-            if (state.mode != CamMode.PORTRAIT && state.mode != CamMode.NIGHT) {
+            if (state.mode != CamMode.PORTRAIT && state.mode != CamMode.NIGHT && state.mode != CamMode.ASTRO) {
                 ZoomBar(
                     zoom = state.zoom,
                     minZoom = state.minZoom,
@@ -753,6 +763,7 @@ fun CameraScreen(
                 capturingCount = capturingCount,
                 uiRotation = tilt.uiRotation,
                 flipAnimDeg = flipAnimDeg,
+                onOpenQuickSettings = { showQuickSettings = true },
                 onOpenGallery = {
                     feedback.tap()
                     showGallery = true
@@ -781,6 +792,16 @@ fun CameraScreen(
                 onClose = { showGallery = false },
             )
         }
+    }
+
+    if (showQuickSettings) {
+        QuickSettingsSheet(
+            settings = settings,
+            state = state,
+            maxAstroSeconds = ((engine.currentLens?.exposureRange?.upper ?: 0L) / 1_000_000_000L).toInt().coerceAtMost(30),
+            onUpdate = { block -> settingsStore.update(block) },
+            onDismiss = { showQuickSettings = false },
+        )
     }
 
     if (showSettings) {
@@ -830,9 +851,10 @@ private fun ModeSelectorRow(
     onSelectMode: (CamMode) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val availableModes = remember(state.nightAvailable, state.portraitAvailable) {
+    val availableModes = remember(state.nightAvailable, state.portraitAvailable, state.astroAvailable) {
         CamMode.entries.filter { m ->
             when (m) {
+                CamMode.ASTRO -> state.astroAvailable
                 CamMode.NIGHT -> state.nightAvailable
                 CamMode.PORTRAIT -> state.portraitAvailable
                 else -> true
@@ -840,14 +862,22 @@ private fun ModeSelectorRow(
         }
     }
 
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = modifier
-            .glass(CircleShape, strong = true)
-            .padding(horizontal = 6.dp, vertical = 4.dp),
-    ) {
-        availableModes.forEach { mode ->
+    val listState = rememberLazyListState()
+    LaunchedEffect(state.mode, availableModes) {
+        val index = availableModes.indexOf(state.mode)
+        if (index >= 0) listState.animateScrollToItem(index)
+    }
+
+    BoxWithConstraints(modifier = modifier.fillMaxWidth()) {
+        val sidePadding = (maxWidth / 2 - 43.dp).coerceAtLeast(0.dp)
+        LazyRow(
+            state = listState,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            contentPadding = PaddingValues(horizontal = sidePadding, vertical = 4.dp),
+            modifier = Modifier.fillMaxWidth().glass(CircleShape, strong = true),
+        ) {
+            itemsIndexed(availableModes) { _, mode ->
             val selected = state.mode == mode
             Box(
                 contentAlignment = Alignment.Center,
@@ -866,6 +896,7 @@ private fun ModeSelectorRow(
             }
         }
     }
+    }
 }
 
 @Composable
@@ -881,6 +912,7 @@ private fun BottomShutterRow(
     onTogglePause: () -> Unit,
     onShutterClick: () -> Unit,
     onFlipCamera: () -> Unit,
+    onOpenQuickSettings: () -> Unit,
 ) {
     val rot by animateFloatAsState(targetValue = uiRotation, animationSpec = tween(220), label = "bottomRot")
     val flipRot by animateFloatAsState(targetValue = flipAnimDeg + uiRotation, animationSpec = tween(320), label = "flipRot")
@@ -998,9 +1030,15 @@ private fun BottomShutterRow(
                             tint = Pc.Bg,
                             modifier = Modifier.size(24.dp),
                         )
-                        isCapturing && mode == CamMode.NIGHT -> CircularProgressIndicator(
+                        isCapturing && (mode == CamMode.NIGHT || mode == CamMode.ASTRO) -> CircularProgressIndicator(
                             color = Pc.Bg,
                             strokeWidth = 2.5.dp,
+                            modifier = Modifier.size(22.dp),
+                        )
+                        mode == CamMode.ASTRO -> Icon(
+                            imageVector = Icons.Outlined.AutoAwesome,
+                            contentDescription = "Астрофото",
+                            tint = Pc.Bg,
                             modifier = Modifier.size(22.dp),
                         )
                         mode == CamMode.NIGHT -> Icon(
@@ -1030,6 +1068,22 @@ private fun BottomShutterRow(
                     contentDescription = "Сменить камеру",
                     tint = Pc.Text,
                     modifier = Modifier.size(25.dp),
+                )
+            }
+        }
+        if (rec == null) {
+            IconButton(
+                onClick = onOpenQuickSettings,
+                modifier = Modifier
+                    .size(44.dp)
+                    .glass(CircleShape, strong = true)
+                    .rotate(rot),
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.Tune,
+                    contentDescription = "Быстрые настройки",
+                    tint = Pc.Accent,
+                    modifier = Modifier.size(23.dp),
                 )
             }
         }

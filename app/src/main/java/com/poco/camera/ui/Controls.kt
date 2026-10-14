@@ -716,6 +716,78 @@ fun formatShutterNs(ns: Long): String {
 }
 
 /**
+ * Частые параметры прямо рядом с кнопкой переключения камеры.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun QuickSettingsSheet(
+    settings: CamSettings,
+    state: EngineState,
+    maxAstroSeconds: Int,
+    onUpdate: ((CamSettings) -> CamSettings) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = Pc.Surface,
+        contentColor = Pc.Text,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 32.dp),
+        ) {
+            Text(
+                text = "Быстрые настройки",
+                style = MaterialTheme.typography.titleLarge,
+                color = Pc.Text,
+                modifier = Modifier.padding(bottom = 12.dp),
+            )
+            ToggleSettingRow(
+                title = "Звук затвора и записи",
+                checked = settings.shutterSound,
+                onCheckedChange = { value -> onUpdate { it.copy(shutterSound = value) } },
+            )
+            ChipSettingRow(
+                title = "Вспышка",
+                options = FlashSetting.entries,
+                selected = settings.flash,
+                labelOf = { v -> when (v) {
+                    FlashSetting.OFF -> "Выкл"
+                    FlashSetting.AUTO -> "Авто"
+                    FlashSetting.ON -> "Вкл"
+                } },
+                onSelect = { value -> onUpdate { it.copy(flash = value) } },
+            )
+            ChipSettingRow(
+                title = "Таймер перед съёмкой",
+                options = listOf(0, 3, 10),
+                selected = settings.timer,
+                labelOf = { if (it == 0) "Выкл" else "${it} с" },
+                onSelect = { value -> onUpdate { it.copy(timer = value) } },
+            )
+            if (state.mode == CamMode.ASTRO) {
+                val choices = listOf(1, 2, 4, 8, 15, 30).filter { it <= maxAstroSeconds }
+                if (choices.isNotEmpty()) {
+                    ChipSettingRow(
+                        title = "Выдержка астрофото",
+                        options = choices,
+                        selected = settings.astroExposureSec.coerceAtMost(maxAstroSeconds),
+                        labelOf = { "${it} с" },
+                        onSelect = { value -> onUpdate { it.copy(astroExposureSec = value) } },
+                    )
+                }
+                Text(
+                    text = "Нужен штатив. Один длинный кадр, без стекинга GCam.",
+                    color = Pc.TextDim,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(top = 10.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
  * Чистая шторка настроек в стиле GCam без лишнего шума.
  */
 @OptIn(ExperimentalMaterial3Api::class)

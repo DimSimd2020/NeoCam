@@ -20,6 +20,7 @@ data class CamSettings(
     val aspect: Aspect = Aspect.R4_3,
     val flash: FlashSetting = FlashSetting.OFF,
     val timer: Int = 0,
+    val astroExposureSec: Int = 2,
     val grid: Boolean = true,
     val level: Boolean = true,
     val focusPeaking: Boolean = true,
@@ -54,6 +55,7 @@ class SettingsStore(context: Context) {
             aspect = enumOr(prefs.getString("aspect", null), d.aspect),
             flash = enumOr(prefs.getString("flash", null), d.flash),
             timer = prefs.getInt("timer", d.timer),
+            astroExposureSec = prefs.getInt("astroExposureSec", d.astroExposureSec).coerceIn(1, 30),
             grid = prefs.getBoolean("grid", d.grid),
             level = prefs.getBoolean("level", d.level),
             focusPeaking = prefs.getBoolean("focusPeaking", d.focusPeaking),
@@ -77,6 +79,7 @@ class SettingsStore(context: Context) {
             .putString("aspect", s.aspect.name)
             .putString("flash", s.flash.name)
             .putInt("timer", s.timer)
+            .putInt("astroExposureSec", s.astroExposureSec)
             .putBoolean("grid", s.grid)
             .putBoolean("level", s.level)
             .putBoolean("focusPeaking", s.focusPeaking)

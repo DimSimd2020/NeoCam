@@ -324,6 +324,7 @@ class CameraEngine(private val context: Context) {
                 else -> null
             }
         }
+        val astroAvailable = !isFront && base.manualSensor && (base.exposureRange?.upper ?: 0L) >= 1_000_000_000L
         val stab = caps?.isStabilizationSupported == true
         val fps60 = info?.supportedFrameRateRanges?.any { it.lower >= 60 } == true
         val rawMp = base.highResSize?.let { sz -> (sz.area() / 1_000_000).toInt() }
@@ -335,6 +336,7 @@ class CameraEngine(private val context: Context) {
                 hwMaxZoom = hwMax,
                 zoomStops = stops,
                 nightAvailable = night,
+                astroAvailable = astroAvailable,
                 portraitAvailable = bokeh,
                 highResMp = rawMp,
                 videoQualities = qualities,
@@ -351,10 +353,11 @@ class CameraEngine(private val context: Context) {
         val s = _state.value
         if (s.recording != null || s.mode == mode) return
         if (mode == CamMode.NIGHT && !s.nightAvailable) return
+        if (mode == CamMode.ASTRO && !s.astroAvailable) return
         if (mode == CamMode.PORTRAIT && !s.portraitAvailable) return
         _state.update { it.copy(mode = mode) }
         updateRanges()
-        setZoom(if (mode == CamMode.NIGHT || mode == CamMode.PORTRAIT) 1f else _state.value.zoom)
+        setZoom(if (mode == CamMode.NIGHT || mode == CamMode.PORTRAIT || mode == CamMode.ASTRO) 1f else _state.value.zoom)
     }
 
     fun switchFacing() {
@@ -364,7 +367,8 @@ class CameraEngine(private val context: Context) {
         val lens = (if (toFront) front else mainBack) ?: return
         _state.update { it.copy(facing = lens.facing, lensId = lens.id, zoom = 1f, extraZoom = 1f) }
         updateRanges()
-        if (_state.value.mode == CamMode.NIGHT && !_state.value.nightAvailable ||
+        if (_state.value.mode == CamMode.ASTRO && !_state.value.astroAvailable ||
+            _state.value.mode == CamMode.NIGHT && !_state.value.nightAvailable ||
             _state.value.mode == CamMode.PORTRAIT && !_state.value.portraitAvailable
         ) {
             _state.update { it.copy(mode = CamMode.PHOTO) }
@@ -376,7 +380,7 @@ class CameraEngine(private val context: Context) {
         val s = _state.value
         if (s.facing == CameraSelector.LENS_FACING_FRONT) return front
         val main = mainBack ?: return null
-        if (s.mode == CamMode.NIGHT || s.mode == CamMode.PORTRAIT) return main
+        if (s.mode == CamMode.NIGHT || s.mode == CamMode.PORTRAIT || s.mode == CamMode.ASTRO) return main
         ultraWide?.let { if (z < 0.999f) return it }
         val tele = teleLenses.lastOrNull { z >= it.factor * 0.98f }
         if (tele != null) return tele
@@ -440,10 +444,10 @@ class CameraEngine(private val context: Context) {
         val is1PKey = is1PKeys[lens.id]
 
         fun applyFastZslOptions(ext2: Camera2Interop.Extender<*>) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && cfg.mode != CamMode.VIDEO) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && cfg.mode != CamMode.VIDEO && cfg.mode != CamMode.ASTRO) {
                 ext2.setCaptureRequestOption(CaptureRequest.CONTROL_ENABLE_ZSL, true)
             }
-            if (fastFps != null && cfg.mode != CamMode.VIDEO && cfg.mode != CamMode.NIGHT) {
+            if (fastFps != null && cfg.mode != CamMode.VIDEO && cfg.mode != CamMode.NIGHT && cfg.mode != CamMode.ASTRO) {
                 ext2.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fastFps)
             }
             if (cfg.mode == CamMode.PHOTO) {
@@ -453,8 +457,8 @@ class CameraEngine(private val context: Context) {
         }
 
         data class Variant(val analysis: Boolean, val highRes: Boolean, val fps60: Boolean, val stab: Boolean)
-        val wantHighRes = cfg.highRes && lens.highResSize != null
-        val first = Variant(analysis = !usingExt && cfg.mode != CamMode.VIDEO, highRes = wantHighRes, fps60 = cfg.fps60, stab = cfg.stabilization)
+        val wantHighRes = cfg.highRes && lens.highResSize != null && cfg.mode != CamMode.ASTRO
+        val first = Variant(analysis = !usingExt && cfg.mode != CamMode.VIDEO && cfg.mode != CamMode.ASTRO, highRes = wantHighRes, fps60 = cfg.fps60, stab = cfg.stabilization)
         val variants = listOf(
             first,
             first.copy(analysis = false),
@@ -658,6 +662,10 @@ class CameraEngine(private val context: Context) {
 
     fun setFlash(flash: FlashSetting) {
         val ic = imageCapture ?: return
+        if (_state.value.mode == CamMode.ASTRO) {
+            ic.flashMode = ImageCapture.FLASH_MODE_OFF
+            return
+        }
         val front = _state.value.facing == CameraSelector.LENS_FACING_FRONT
         runCatching {
             ic.flashMode = if (front) ImageCapture.FLASH_MODE_OFF else when (flash) {
@@ -683,6 +691,28 @@ class CameraEngine(private val context: Context) {
     private fun applyPro() {
         val cam = camera ?: return
         val c2 = runCatching { Camera2CameraControl.from(cam.cameraControl) }.getOrNull() ?: return
+        if (boundMode == CamMode.ASTRO) {
+            val lens = currentLens ?: return
+            if (!lens.manualSensor) return
+            val sec = (boundConfig?.astroExposureSec ?: 2).coerceIn(1, 30)
+            val exp = (sec * 1_000_000_000L).coerceIn(
+                lens.exposureRange?.lower ?: 1L,
+                lens.exposureRange?.upper ?: 30_000_000_000L,
+            )
+            val iso = 1600.coerceIn(lens.isoRange?.lower ?: 100, lens.isoRange?.upper ?: 1600)
+            val options = CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                .setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, exp)
+                .setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, max(exp, 33_333_333L))
+                .setCaptureRequestOption(CaptureRequest.CONTROL_ENABLE_ZSL, false)
+            if (lens.hasAf) {
+                options.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                options.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, 0f)
+            }
+            runCatching { c2.setCaptureRequestOptions(options.build()) }
+            return
+        }
         if (boundMode != CamMode.PRO) {
             if (boundMode == CamMode.PHOTO && meteredTotalLight > 0.0) {
                 updateAntiBlurAe(force = true)
@@ -822,6 +852,7 @@ class CameraEngine(private val context: Context) {
             return
         }
         val s = _state.value
+        if (s.mode == CamMode.ASTRO && capturing.value > 0) return
         val extra = s.extraZoom
         val isSquare = currentAspect == Aspect.R1_1 && s.mode != CamMode.VIDEO
         val isMirror = s.facing == CameraSelector.LENS_FACING_FRONT && mirrorFront

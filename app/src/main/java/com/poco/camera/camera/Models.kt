@@ -11,6 +11,7 @@ import com.poco.camera.data.Aspect
 import com.poco.camera.data.VideoRes
 
 enum class CamMode(val title: String) {
+    ASTRO("Астро"),
     NIGHT("Ночь"),
     PORTRAIT("Портрет"),
     PHOTO("Камера"),
@@ -81,6 +82,7 @@ data class EngineState(
     val torch: Boolean = false,
     val nightAvailable: Boolean = false,
     val portraitAvailable: Boolean = false,
+    val astroAvailable: Boolean = false,
     val highResMp: Int? = null,
     val videoQualities: List<VideoRes> = emptyList(),
     val stabilizationSupported: Boolean = false,
@@ -98,6 +100,7 @@ data class BindConfig(
     val videoRes: VideoRes,
     val fps60: Boolean,
     val stabilization: Boolean,
+    val astroExposureSec: Int = 2,
 )
 
 sealed interface EngineEvent {
