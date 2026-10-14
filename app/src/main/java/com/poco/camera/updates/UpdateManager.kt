@@ -74,7 +74,7 @@ class UpdateManager(private val context: Context) {
             val expected = Regex("[a-fA-F0-9]{64}").find(readSmallText(update.sha256Url))
                 ?.value?.lowercase() ?: error("Некорректная SHA-256 сумма")
             val dir = File(context.cacheDir, "updates").also { it.mkdirs() }
-            val part = File(dir, "NeoCam-update.apk.part")
+            val part = File(dir, "NeoCam-download.apk")
             val apk = File(dir, "NeoCam-update.apk")
             part.delete()
             val digest = MessageDigest.getInstance("SHA-256")
