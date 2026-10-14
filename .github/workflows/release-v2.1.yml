@@ -30,12 +30,13 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
       - name: Install Android API 35
-        run: |
-          # GitHub-hosted Ubuntu runners already include Android cmdline-tools.
-          # setup-android@v3 attempts to install the obsolete "tools" package and fails.
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
+        run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
