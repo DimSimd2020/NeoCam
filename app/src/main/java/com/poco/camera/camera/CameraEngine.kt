@@ -123,7 +123,6 @@ class CameraEngine(private val context: Context) {
     val state: StateFlow<EngineState> = _state.asStateFlow()
     val events = MutableSharedFlow<EngineEvent>(extraBufferCapacity = 32)
     val objects = MutableStateFlow<List<TrackedObj>>(emptyList())
-    val peakingBitmap = MutableStateFlow<Bitmap?>(null)
     val qr = MutableStateFlow<QrHit?>(null)
     val live = MutableStateFlow(LiveExposure())
     val capturing = MutableStateFlow(0)
@@ -132,7 +131,6 @@ class CameraEngine(private val context: Context) {
     var analysisFlags = VisionAnalyzer.Flags(
         objects = true,
         qr = true,
-        peaking = false,
         mirror = false,
         viewAspect = 0.75f,
     )
@@ -140,7 +138,6 @@ class CameraEngine(private val context: Context) {
     private val analyzer = VisionAnalyzer(
         flags = { analysisFlags },
         onObjects = { objects.value = it },
-        onPeaking = { peakingBitmap.value = it },
         onQr = { qr.value = it },
     )
 
@@ -561,11 +558,12 @@ class CameraEngine(private val context: Context) {
         val point = pv.meteringPointFactory.createPoint(
             (nx.coerceIn(0.02f, 0.98f)) * pv.width,
             (ny.coerceIn(0.02f, 0.98f)) * pv.height,
+            0.18f,
         )
         val manualFocus = boundMode == CamMode.PRO && pro.focus != null
         val flags = if (manualFocus) FocusMeteringAction.FLAG_AE else FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE
         val action = FocusMeteringAction.Builder(point, flags).apply {
-            if (lock) disableAutoCancel() else setAutoCancelDuration(5, TimeUnit.SECONDS)
+            if (lock) disableAutoCancel() else setAutoCancelDuration(2, TimeUnit.SECONDS)
         }.build()
         _state.update { it.copy(aeAfLocked = lock) }
         val hasAf = currentLens?.hasAf == true

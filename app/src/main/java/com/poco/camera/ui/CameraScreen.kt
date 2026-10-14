@@ -130,7 +130,6 @@ fun CameraScreen(
     val settings by settingsStore.state.collectAsState()
     val live by engine.live.collectAsState()
     val capturingCount by engine.capturing.collectAsState()
-    val peakingBmp by engine.peakingBitmap.collectAsState()
     val qrHit by engine.qr.collectAsState()
     val tilt by sensorTracker.state.collectAsState()
     val latestUri by gallery.latestUri.collectAsState()
@@ -196,9 +195,10 @@ fun CameraScreen(
     }
     val aimUi by aimController.ui.collectAsState()
 
-    LaunchedEffect(settings.aimDelay, settings.autoShoot) {
+    LaunchedEffect(settings.aimDelay, settings.autoShoot, live.afFocused) {
         aimController.countdownSeconds = settings.aimDelay
         aimController.autoShootEnabled = settings.autoShoot
+        aimController.hwAfFocused = live.afFocused
     }
 
     LaunchedEffect(Unit) {
@@ -356,29 +356,25 @@ fun CameraScreen(
             engine.currentAspect = effectiveAspect
         }
 
-        val focusRoi = remember(focusTap, aimUi.target) {
-            focusTap?.point?.let { pt ->
-                RectF(pt.x - 0.18f, pt.y - 0.18f, pt.x + 0.18f, pt.y + 0.18f)
-            } ?: aimUi.target?.rect
+        val anchorPt = remember(focusTap, aimUi.target) {
+            focusTap?.point ?: aimController.anchorPoint
         }
 
         LaunchedEffect(
             settings.autoTrack,
             settings.qr,
-            settings.focusPeaking,
             state.facing,
             targetViewRatio,
             state.mode,
             showGallery,
-            focusRoi,
+            anchorPt,
         ) {
             engine.analysisFlags = VisionAnalyzer.Flags(
                 objects = !showGallery && settings.autoTrack && state.mode.isPhotoLike,
                 qr = !showGallery && settings.qr && state.mode.isPhotoLike,
-                peaking = !showGallery && settings.focusPeaking && state.mode.isPhotoLike,
                 mirror = state.facing == CameraSelector.LENS_FACING_FRONT,
                 viewAspect = 1f / targetViewRatio,
-                focusRegion = focusRoi,
+                anchorPoint = anchorPt,
             )
         }
 
@@ -527,17 +523,6 @@ fun CameraScreen(
                     },
             )
 
-            // Подсветка резких краёв в фокусе (Focus Peaking)
-            if (settings.focusPeaking && state.mode.isPhotoLike) {
-                FocusPeakingOverlay(
-                    bitmap = peakingBmp,
-                    modifier = Modifier.graphicsLayer {
-                        scaleX = state.extraZoom
-                        scaleY = state.extraZoom
-                    },
-                )
-            }
-
             if (settings.grid) {
                 GridOverlay()
             }
@@ -549,7 +534,7 @@ fun CameraScreen(
                 )
             }
 
-            if (settings.autoTrack && state.mode.isPhotoLike && focusTap == null) {
+            if (settings.autoTrack && state.mode.isPhotoLike) {
                 AimOverlay(
                     aim = aimUi,
                     extraZoom = state.extraZoom,
@@ -644,7 +629,7 @@ fun CameraScreen(
                     },
                     onTogglePeaking = {
                         feedback.tap()
-                        settingsStore.update { it.copy(focusPeaking = !it.focusPeaking) }
+                        settingsStore.update { it.copy(autoTrack = !it.autoTrack) }
                     },
                     onCycleAspect = {
                         feedback.tap()

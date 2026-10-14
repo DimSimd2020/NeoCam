@@ -13,17 +13,18 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -57,14 +58,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -88,25 +91,6 @@ data class FocusTapState(
     val point: PointF,
     val locked: Boolean = false,
 )
-
-/**
- * Подсветка резких контуров объекта в фокусе (Focus Peaking).
- */
-@Composable
-fun FocusPeakingOverlay(
-    bitmap: Bitmap?,
-    modifier: Modifier = Modifier,
-) {
-    val bmp = bitmap ?: return
-    val img = remember(bmp) { bmp.asImageBitmap() }
-    Image(
-        bitmap = img,
-        contentDescription = null,
-        contentScale = ContentScale.FillBounds,
-        filterQuality = FilterQuality.Medium,
-        modifier = modifier.fillMaxSize(),
-    )
-}
 
 /**
  * Сетка третей 3x3 в стиле GCam.
@@ -279,7 +263,9 @@ fun unzoomPoint(nx: Float, ny: Float, extraZoom: Float): PointF {
 }
 
 /**
- * Трекинг-фокус объекта в стиле GCam (чистое кольцо слежения без текстового мусора).
+ * Подсветка и трекинг объектов в стиле GCam:
+ * - Мягко облегает контур главного объекта скруглёнными уголками + центральным кольцом фокуса (120 Гц интерполяция).
+ * - Второстепенные объекты отмечаются аккуратными тонкими контурами, по которым можно тапнуть для переключения фокуса.
  */
 @Composable
 fun AimOverlay(
@@ -288,52 +274,67 @@ fun AimOverlay(
     modifier: Modifier = Modifier,
 ) {
     val pulse by rememberInfiniteTransition(label = "aimPulse").animateFloat(
-        initialValue = 0.94f,
-        targetValue = 1.06f,
-        animationSpec = infiniteRepeatable(tween(550, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        initialValue = 0.96f,
+        targetValue = 1.04f,
+        animationSpec = infiniteRepeatable(tween(520, easing = FastOutSlowInEasing), RepeatMode.Reverse),
         label = "pulse",
     )
 
-    val targetRect = aim.target?.rect?.withExtraZoom(extraZoom)
-    val ringColor = when (aim.phase) {
+    val rawTarget = aim.target?.rect?.withExtraZoom(extraZoom)
+    val hasTarget = rawTarget != null
+
+    val animSpec = spring<Float>(dampingRatio = 0.86f, stiffness = Spring.StiffnessMedium)
+    val animLeft by animateFloatAsState(targetValue = rawTarget?.left ?: 0.38f, animationSpec = animSpec, label = "al")
+    val animTop by animateFloatAsState(targetValue = rawTarget?.top ?: 0.38f, animationSpec = animSpec, label = "at")
+    val animRight by animateFloatAsState(targetValue = rawTarget?.right ?: 0.62f, animationSpec = animSpec, label = "ar")
+    val animBottom by animateFloatAsState(targetValue = rawTarget?.bottom ?: 0.62f, animationSpec = animSpec, label = "ab")
+    val targetAlpha by animateFloatAsState(
+        targetValue = if (hasTarget) 1f else 0f,
+        animationSpec = tween(180),
+        label = "tAlpha",
+    )
+
+    val mainColor = when (aim.phase) {
         AimPhase.READY, AimPhase.COUNTDOWN -> Pc.Accent
-        AimPhase.FOCUSING -> Color.White.copy(alpha = 0.9f)
+        AimPhase.FOCUSING -> Color.White
         AimPhase.SHOT -> Pc.AccentGlow
-        AimPhase.SEARCHING -> Color.White.copy(alpha = 0.5f)
+        AimPhase.SEARCHING -> Color.White.copy(alpha = 0.65f)
     }
 
     Box(modifier = modifier.fillMaxSize()) {
         Canvas(modifier = Modifier.fillMaxSize()) {
-            if (size.width < 32f || size.height < 32f) return@Canvas
-            val tr = targetRect ?: return@Canvas
-            val cx = (tr.centerX() * size.width).coerceIn(28f, max(28f, size.width - 28f))
-            val cy = (tr.centerY() * size.height).coerceIn(28f, max(28f, size.height - 28f))
-            val baseR = 30.dp.toPx() * (if (aim.phase == AimPhase.FOCUSING) pulse else 1f)
+            if (size.width < 64f || size.height < 64f) return@Canvas
 
-            // Двойное кольцо слежения GCam
-            drawCircle(
-                color = Color(0x45000000),
-                radius = baseR,
-                center = Offset(cx, cy),
-                style = Stroke(width = 3.dp.toPx()),
-            )
-            drawCircle(
-                color = ringColor,
-                radius = baseR,
-                center = Offset(cx, cy),
-                style = Stroke(width = 2.dp.toPx()),
-            )
-            drawCircle(
-                color = ringColor.copy(alpha = 0.55f),
-                radius = baseR * 0.68f,
-                center = Offset(cx, cy),
-                style = Stroke(width = 1.2.dp.toPx()),
-            )
-            drawCircle(
-                color = ringColor,
-                radius = 3.dp.toPx(),
-                center = Offset(cx, cy),
-            )
+            // Второстепенные распознанные объекты (тап по любому переключает на него фокус)
+            for (other in aim.others) {
+                val r = other.rect.withExtraZoom(extraZoom)
+                if (r.right <= 0.02f || r.left >= 0.98f || r.bottom <= 0.02f || r.top >= 0.98f) continue
+                drawGCamObjectFrame(
+                    rect = r,
+                    color = Color.White.copy(alpha = 0.45f),
+                    strokePx = 1.6.dp.toPx(),
+                    fillAlpha = 0.03f,
+                    showCenterRing = false,
+                )
+            }
+
+            // Главный отслеживаемый объект
+            if (targetAlpha > 0.02f) {
+                val cx = (animLeft + animRight) * 0.5f
+                val cy = (animTop + animBottom) * 0.5f
+                val s = if (aim.phase == AimPhase.FOCUSING) pulse else 1f
+                val hw = max(0.04f, (animRight - animLeft) * 0.5f * s)
+                val hh = max(0.04f, (animBottom - animTop) * 0.5f * s)
+                val smoothRect = RectF(cx - hw, cy - hh, cx + hw, cy + hh)
+
+                drawGCamObjectFrame(
+                    rect = smoothRect,
+                    color = mainColor.copy(alpha = targetAlpha),
+                    strokePx = 2.4.dp.toPx(),
+                    fillAlpha = if (aim.phase == AimPhase.READY) 0.08f * targetAlpha else 0.04f * targetAlpha,
+                    showCenterRing = true,
+                )
+            }
         }
 
         // Обратный отсчёт при включённом автоспуске
@@ -358,6 +359,96 @@ fun AimOverlay(
                 )
             }
         }
+    }
+}
+
+private fun DrawScope.drawGCamObjectFrame(
+    rect: RectF,
+    color: Color,
+    strokePx: Float,
+    fillAlpha: Float,
+    showCenterRing: Boolean,
+) {
+    val maxLeft = max(8f, size.width - 36f)
+    val maxTop = max(8f, size.height - 36f)
+    val l = (rect.left * size.width).coerceIn(8f, maxLeft)
+    val t = (rect.top * size.height).coerceIn(8f, maxTop)
+    val r = (rect.right * size.width).coerceIn(l + 24f, max(l + 24f, size.width - 8f))
+    val b = (rect.bottom * size.height).coerceIn(t + 24f, max(t + 24f, size.height - 8f))
+    val w = r - l
+    val h = b - t
+
+    val cornerRadius = min(w, h).coerceAtMost(72.dp.toPx()) * 0.22f
+    val arm = (min(w, h) * 0.28f).coerceIn(14.dp.toPx(), 34.dp.toPx())
+    val cr = min(cornerRadius, arm * 0.65f)
+
+    // Мягкая подсветка области объекта
+    drawRoundRect(
+        color = color.copy(alpha = fillAlpha),
+        topLeft = Offset(l, t),
+        size = Size(w, h),
+        cornerRadius = CornerRadius(cr, cr),
+    )
+
+    // Скруглённые уголки в стиле GCam / Google Lens с мягкой тенью для читаемости на любом фоне
+    val path = Path().apply {
+        // Верхний левый уголок
+        moveTo(l, t + arm)
+        lineTo(l, t + cr)
+        quadraticTo(l, t, l + cr, t)
+        lineTo(l + arm, t)
+
+        // Верхний правый уголок
+        moveTo(r - arm, t)
+        lineTo(r - cr, t)
+        quadraticTo(r, t, r, t + cr)
+        lineTo(r, t + arm)
+
+        // Нижний правый уголок
+        moveTo(r, b - arm)
+        lineTo(r, b - cr)
+        quadraticTo(r, b, r - cr, b)
+        lineTo(r - arm, b)
+
+        // Нижний левый уголок
+        moveTo(l + arm, b)
+        lineTo(l + cr, b)
+        quadraticTo(l, b, l, b - cr)
+        lineTo(l, b - arm)
+    }
+
+    drawPath(
+        path = path,
+        color = Color(0x45000000),
+        style = Stroke(width = strokePx + 1.8.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round),
+    )
+    drawPath(
+        path = path,
+        color = color,
+        style = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round),
+    )
+
+    if (showCenterRing) {
+        val cx = (l + r) * 0.5f
+        val cy = (t + b) * 0.5f
+        val ringR = min(min(w, h) * 0.22f, 22.dp.toPx()).coerceAtLeast(10.dp.toPx())
+        drawCircle(
+            color = Color(0x40000000),
+            radius = ringR,
+            center = Offset(cx, cy),
+            style = Stroke(width = 2.4.dp.toPx()),
+        )
+        drawCircle(
+            color = color.copy(alpha = 0.85f),
+            radius = ringR,
+            center = Offset(cx, cy),
+            style = Stroke(width = 1.6.dp.toPx()),
+        )
+        drawCircle(
+            color = color,
+            radius = 2.6.dp.toPx(),
+            center = Offset(cx, cy),
+        )
     }
 }
 

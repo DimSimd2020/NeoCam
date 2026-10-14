@@ -1,6 +1,6 @@
 package com.poco.camera.camera
 
-import android.graphics.Bitmap
+import android.graphics.PointF
 import android.graphics.Rect
 import android.graphics.RectF
 import android.os.SystemClock
@@ -24,25 +24,23 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Анализ кадров:
- * 1) Подсветка резких краёв в фокусе (Focus Peaking по высокочастотному Лапласиану/Собелю Y-канала)
- * 2) Отслеживание объектов (ML Kit STREAM_MODE) со сглаживанием координат
- * 3) Сканирование QR-кодов
+ * Гибридный анализатор кадра в стиле GCam:
+ * 1) Находит объекты через ML Kit ObjectDetection и уточняет их реальные границы по градиенту яркости (Y-плоскость).
+ * 2) Если ML Kit не распознал мелкий/нестандартный предмет в центре или в точке касания — находит контур предмета по локальному контрасту краёв.
+ * 3) Сканирует QR-коды.
  */
 class VisionAnalyzer(
     private val flags: () -> Flags,
     private val onObjects: (List<TrackedObj>) -> Unit,
-    private val onPeaking: (Bitmap?) -> Unit,
     private val onQr: (QrHit) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
     data class Flags(
         val objects: Boolean,
         val qr: Boolean,
-        val peaking: Boolean,
         val mirror: Boolean,
         val viewAspect: Float,
-        val focusRegion: RectF? = null,
+        val anchorPoint: PointF? = null,
     )
 
     private val detector: ObjectDetector = ObjectDetection.getClient(
@@ -58,14 +56,12 @@ class VisionAnalyzer(
             .build()
     )
     private var frameNo = 0L
-    private var lastTrackedRects = mutableListOf<TrackedObj>()
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(proxy: ImageProxy) {
         val media = proxy.image
         val f = flags()
-        if (media == null || (!f.objects && !f.qr && !f.peaking)) {
-            if (!f.peaking) onPeaking(null)
+        if (media == null || (!f.objects && !f.qr)) {
             proxy.close()
             return
         }
@@ -73,17 +69,9 @@ class VisionAnalyzer(
         val rotation = proxy.imageInfo.rotationDegrees
         val mapper = Mapper(proxy.width, proxy.height, rotation, f.mirror, f.viewAspect)
 
-        // 1. Быстрая подсветка резких контуров объекта в фокусе (Focus Peaking) по Y-каналу
-        if (f.peaking) {
-            val bmp = runCatching {
-                extractFocusPeakingBitmap(proxy, rotation, f.mirror, f.focusRegion ?: lastTrackedRects.firstOrNull()?.rect)
-            }.getOrNull()
-            onPeaking(bmp)
-        } else {
-            onPeaking(null)
-        }
+        // Строим компактную карту градиентов резкости 80x60 из Y-канала для точной привязки к краям предмета
+        val edgeGrid = if (f.objects) buildEdgeGrid(proxy, rotation, f.mirror) else null
 
-        // 2. ML Kit распознавание объектов и QR
         val input = InputImage.fromMediaImage(media, rotation)
         val objTask = if (f.objects) detector.process(input) else null
         val qrTask = if (f.qr && frameNo % 4 == 0L) scanner.process(input) else null
@@ -96,14 +84,27 @@ class VisionAnalyzer(
         Tasks.whenAllComplete(tasks).addOnCompleteListener {
             try {
                 if (objTask != null && objTask.isSuccessful) {
-                    val mapped = objTask.result.mapIndexedNotNull { i, o ->
-                        val r = mapper.map(o.boundingBox)
-                        if (r.width() < 0.04f || r.height() < 0.04f) null
-                        else TrackedObj(o.trackingId ?: (-1 - i), r, labelOf(o))
+                    val mlObjs = objTask.result.mapIndexedNotNull { i, o ->
+                        val rawRect = mapper.map(o.boundingBox)
+                        if (rawRect.width() < 0.05f || rawRect.height() < 0.05f) {
+                            null
+                        } else {
+                            val tight = edgeGrid?.tighten(rawRect) ?: rawRect
+                            TrackedObj(o.trackingId ?: (-1 - i), tight, labelOf(o))
+                        }
+                    }.toMutableList()
+
+                    // Если пользователь тапнул по предмету (или держит предмет в центре), который ML Kit пропустил,
+                    // находим границы этого предмета по карте контрастных краёв
+                    val anchor = f.anchorPoint ?: PointF(0.5f, 0.5f)
+                    val coveredByMl = mlObjs.any { it.rect.contains(anchor.x, anchor.y) }
+                    if (!coveredByMl && edgeGrid != null) {
+                        edgeGrid.findSalientObjectAt(anchor.x, anchor.y)?.let { salientRect ->
+                            mlObjs.add(0, TrackedObj(id = -99, rect = salientRect, label = null))
+                        }
                     }
-                    lastTrackedRects.clear()
-                    lastTrackedRects.addAll(mapped)
-                    onObjects(mapped)
+
+                    onObjects(mlObjs)
                 }
                 if (qrTask != null && qrTask.isSuccessful) {
                     qrTask.result.firstOrNull { !it.rawValue.isNullOrBlank() }?.let { b ->
@@ -118,96 +119,158 @@ class VisionAnalyzer(
     }
 
     /**
-     * Вычисляет карту контуров в резком фокусе (Focus Peaking) из Y-плоскости кадра.
-     * Подсвечивает только реально резкие края (высокий градиент + Лапласиан), как в профессиональных камерах.
+     * Компактная сетка градиентов резкости (72 x 96) для точного облегания контуров объекта.
      */
-    private fun extractFocusPeakingBitmap(
-        proxy: ImageProxy,
-        rotation: Int,
-        mirror: Boolean,
-        roi: RectF?,
-    ): Bitmap? {
-        val plane = proxy.planes.firstOrNull() ?: return null
-        val buf = plane.buffer
-        val rowStride = plane.rowStride
-        val pixelStride = plane.pixelStride
-        val srcW = proxy.width
-        val srcH = proxy.height
-        if (srcW < 32 || srcH < 32) return null
+    private class EdgeGrid(val gw: Int, val gh: Int, val energy: IntArray) {
+        /** Поджимает рамку ML Kit к реальным контрастным краям предмета внутри неё. */
+        fun tighten(r: RectF): RectF {
+            val x0 = (r.left * gw).toInt().coerceIn(1, gw - 2)
+            val x1 = (r.right * gw).toInt().coerceIn(x0 + 1, gw - 1)
+            val y0 = (r.top * gh).toInt().coerceIn(1, gh - 2)
+            val y1 = (r.bottom * gh).toInt().coerceIn(y0 + 1, gh - 1)
 
-        val uprightW = if (rotation % 180 == 0) srcW else srcH
-        val uprightH = if (rotation % 180 == 0) srcH else srcW
-        val step = 3
-        val outW = uprightW / step
-        val outH = uprightH / step
-        if (outW < 16 || outH < 16) return null
-
-        val pixels = IntArray(outW * outH)
-        val limit = buf.limit()
-
-        fun sampleY(ux: Int, uy: Int): Int {
-            val sx: Int
-            val sy: Int
-            when (rotation) {
-                90 -> {
-                    sx = uy
-                    sy = srcH - 1 - ux
-                }
-                180 -> {
-                    sx = srcW - 1 - ux
-                    sy = srcH - 1 - uy
-                }
-                270 -> {
-                    sx = srcW - 1 - uy
-                    sy = ux
-                }
-                else -> {
-                    sx = ux
-                    sy = uy
+            var sum = 0L
+            var count = 0
+            for (y in y0..y1) {
+                val row = y * gw
+                for (x in x0..x1) {
+                    sum += energy[row + x]
+                    count++
                 }
             }
-            val idx = sy * rowStride + sx * pixelStride
-            return if (idx in 0 until limit) (buf.get(idx).toInt() and 0xFF) else 0
-        }
+            if (count == 0) return r
+            val thresh = max(38, ((sum / count) * 14 / 10).toInt())
 
-        // Если есть выбранный объект или область фокуса — усиливаем чувствительность внутри неё
-        val hasRoi = roi != null && roi.width() > 0.05f && roi.height() > 0.05f
-
-        for (oy in 1 until outH - 1) {
-            val uy = oy * step
-            val ny = oy.toFloat() / outH
-            for (ox in 1 until outW - 1) {
-                val ux = ox * step
-                val drawX = if (mirror) (outW - 1 - ox) else ox
-                val nx = drawX.toFloat() / outW
-
-                val inRoi = !hasRoi || (nx >= roi!!.left - 0.08f && nx <= roi.right + 0.08f &&
-                    ny >= roi.top - 0.08f && ny <= roi.bottom + 0.08f)
-
-                val c = sampleY(ux, uy)
-                val l = sampleY(ux - step, uy)
-                val r = sampleY(ux + step, uy)
-                val t = sampleY(ux, uy - step)
-                val b = sampleY(ux, uy + step)
-
-                val gx = abs(r - l)
-                val gy = abs(b - t)
-                val lap = abs(4 * c - l - r - t - b)
-                val edgeEnergy = (gx + gy) + (lap shr 1)
-
-                val threshold = if (inRoi) 62 else 105
-                if (edgeEnergy > threshold) {
-                    val alpha = ((edgeEnergy - threshold) * 3).coerceIn(70, 235)
-                    val color = if (edgeEnergy > threshold + 45) {
-                        (alpha shl 24) or 0x0000E5FF // Яркий сине-голубой неон на пике резкости
-                    } else {
-                        (alpha shl 24) or 0x002979FF // Глубокий синий контур
+            var minX = x1
+            var maxX = x0
+            var minY = y1
+            var maxY = y0
+            var hits = 0
+            for (y in y0..y1) {
+                val row = y * gw
+                for (x in x0..x1) {
+                    if (energy[row + x] >= thresh) {
+                        if (x < minX) minX = x
+                        if (x > maxX) maxX = x
+                        if (y < minY) minY = y
+                        if (y > maxY) maxY = y
+                        hits++
                     }
-                    pixels[oy * outW + drawX] = color
                 }
             }
+            if (hits < 8 || maxX - minX < 4 || maxY - minY < 4) return r
+
+            val padX = 0.015f
+            val padY = 0.015f
+            val nl = (minX.toFloat() / gw - padX).coerceIn(r.left, r.right - 0.06f)
+            val nt = (minY.toFloat() / gh - padY).coerceIn(r.top, r.bottom - 0.06f)
+            val nr = (maxX.toFloat() / gw + padX).coerceIn(nl + 0.06f, r.right)
+            val nb = (maxY.toFloat() / gh + padY).coerceIn(nt + 0.06f, r.bottom)
+            return RectF(nl, nt, nr, nb)
         }
-        return Bitmap.createBitmap(pixels, outW, outH, Bitmap.Config.ARGB_8888)
+
+        /** Находит контрастный объект вокруг точки (ax, ay), если ML Kit его не классифицировал. */
+        fun findSalientObjectAt(ax: Float, ay: Float): RectF? {
+            val cx = (ax * gw).toInt().coerceIn(4, gw - 5)
+            val cy = (ay * gh).toInt().coerceIn(4, gh - 5)
+            val rx = (gw * 0.20f).toInt().coerceAtLeast(6)
+            val ry = (gh * 0.18f).toInt().coerceAtLeast(6)
+
+            val x0 = (cx - rx).coerceAtLeast(1)
+            val x1 = (cx + rx).coerceAtMost(gw - 2)
+            val y0 = (cy - ry).coerceAtLeast(1)
+            val y1 = (cy + ry).coerceAtMost(gh - 2)
+
+            var sumX = 0f
+            var sumY = 0f
+            var totalW = 0f
+            for (y in y0..y1) {
+                val row = y * gw
+                for (x in x0..x1) {
+                    val e = energy[row + x]
+                    if (e > 48) {
+                        val w = (e - 48).toFloat()
+                        sumX += x * w
+                        sumY += y * w
+                        totalW += w
+                    }
+                }
+            }
+            if (totalW < 220f) return null
+
+            val meanX = sumX / totalW
+            val meanY = sumY / totalW
+            var varX = 0f
+            var varY = 0f
+            for (y in y0..y1) {
+                val row = y * gw
+                for (x in x0..x1) {
+                    val e = energy[row + x]
+                    if (e > 48) {
+                        val w = (e - 48).toFloat()
+                        varX += w * (x - meanX) * (x - meanX)
+                        varY += w * (y - meanY) * (y - meanY)
+                    }
+                }
+            }
+            val stdX = kotlin.math.sqrt((varX / totalW).toDouble()).toFloat() * 1.9f
+            val stdY = kotlin.math.sqrt((varY / totalW).toDouble()).toFloat() * 1.9f
+            val halfW = (stdX / gw).coerceIn(0.06f, 0.22f)
+            val halfH = (stdY / gh).coerceIn(0.06f, 0.22f)
+            val ncx = (meanX / gw).coerceIn(0.10f, 0.90f)
+            val ncy = (meanY / gh).coerceIn(0.10f, 0.90f)
+            return RectF(
+                (ncx - halfW).coerceIn(0.03f, 0.88f),
+                (ncy - halfH).coerceIn(0.03f, 0.88f),
+                (ncx + halfW).coerceIn(0.12f, 0.97f),
+                (ncy + halfH).coerceIn(0.12f, 0.97f),
+            )
+        }
+    }
+
+    private fun buildEdgeGrid(proxy: ImageProxy, rotation: Int, mirror: Boolean): EdgeGrid? {
+        return runCatching {
+            val plane = proxy.planes.firstOrNull() ?: return null
+            val buf = plane.buffer
+            val rowStride = plane.rowStride
+            val pixelStride = plane.pixelStride
+            val srcW = proxy.width
+            val srcH = proxy.height
+            val uprightW = if (rotation % 180 == 0) srcW else srcH
+            val uprightH = if (rotation % 180 == 0) srcH else srcW
+            val step = 8
+            val gw = (uprightW / step).coerceAtLeast(16)
+            val gh = (uprightH / step).coerceAtLeast(16)
+            val limit = buf.limit()
+
+            fun sampleY(ux: Int, uy: Int): Int {
+                val sx: Int
+                val sy: Int
+                when (rotation) {
+                    90 -> { sx = uy; sy = srcH - 1 - ux }
+                    180 -> { sx = srcW - 1 - ux; sy = srcH - 1 - uy }
+                    270 -> { sx = srcW - 1 - uy; sy = ux }
+                    else -> { sx = ux; sy = uy }
+                }
+                val idx = sy * rowStride + sx * pixelStride
+                return if (idx in 0 until limit) (buf.get(idx).toInt() and 0xFF) else 0
+            }
+
+            val energy = IntArray(gw * gh)
+            for (gy in 1 until gh - 1) {
+                val uy = gy * step
+                for (gx in 1 until gw - 1) {
+                    val ux = gx * step
+                    val dx = if (mirror) (gw - 1 - gx) else gx
+                    val l = sampleY(ux - step, uy)
+                    val r = sampleY(ux + step, uy)
+                    val t = sampleY(ux, uy - step)
+                    val b = sampleY(ux, uy + step)
+                    energy[gy * gw + dx] = abs(r - l) + abs(b - t)
+                }
+            }
+            EdgeGrid(gw, gh, energy)
+        }.getOrNull()
     }
 
     fun close() {
@@ -228,7 +291,6 @@ class VisionAnalyzer(
         }
     }
 
-    /** Перевод из координат выпрямленного кадра анализа в нормированные координаты PreviewView (0..1). */
     private class Mapper(
         w: Int,
         h: Int,

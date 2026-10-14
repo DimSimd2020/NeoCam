@@ -26,7 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.CenterFocusStrong
 import androidx.compose.material.icons.outlined.FlashAuto
 import androidx.compose.material.icons.outlined.FlashOff
 import androidx.compose.material.icons.outlined.FlashOn
@@ -181,15 +181,15 @@ fun TopControlBar(
                 }
             }
 
-            // Подсветка резких контуров фокуса (Focus Peaking)
+            // Трекинг и подсветка объектов
             IconButton(
                 onClick = onTogglePeaking,
                 modifier = Modifier.size(36.dp).rotate(rot),
             ) {
                 Icon(
-                    imageVector = Icons.Outlined.AutoAwesome,
-                    contentDescription = "Контуры фокуса",
-                    tint = if (settings.focusPeaking) Pc.Accent else Pc.TextDim,
+                    imageVector = Icons.Outlined.CenterFocusStrong,
+                    contentDescription = "Слежение за объектом",
+                    tint = if (settings.autoTrack) Pc.Accent else Pc.TextDim,
                     modifier = Modifier.size(19.dp),
                 )
             }
@@ -768,11 +768,6 @@ fun SettingsSheet(
                     onCheckedChange = { v -> onUpdate { it.copy(highRes = v) } },
                 )
             }
-            ToggleSettingRow(
-                title = "Подсветка резкости краёв (Focus Peaking)",
-                checked = settings.focusPeaking,
-                onCheckedChange = { v -> onUpdate { it.copy(focusPeaking = v) } },
-            )
             ToggleSettingRow(
                 title = "Следящий автофокус по объекту",
                 checked = settings.autoTrack,
