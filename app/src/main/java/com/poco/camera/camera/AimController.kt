@@ -167,21 +167,23 @@ class AimController(
         if (moved > 0.022f) stableSince = now
         val stable = now - stableSince > 420
 
-        // Перефокусируемся, если объект сместился по X/Y ИЛИ изменил размер по Z (приближение/удаление телефона)
-        val scaleChanged = focusedScale > 0f && abs(curScale - focusedScale) / focusedScale > 0.18f
-        val posChanged = focusedAt == null || dist(focusedAt!!, c) > 0.09f
-        val offCenter = dist(c, PointF(0.5f, 0.5f)) > 0.10f
+        // Вызываем точечный замер только если пользователь сам выбрал цель тапом (userLocked)
+        // или если включён автоспуск — иначе оставляем непрерывный аппаратный Continuous AF (Laser ToF + Dual-Pixel PDAF),
+        // чтобы камера мгновенно фокусировалась на руке/предмете при резком приближении без блокировки линзы!
+        val isNewTarget = focusedAt == null
+        val scaleChanged = focusedScale > 0f && abs(curScale - focusedScale) / focusedScale > 0.16f
+        val posChanged = focusedAt != null && dist(focusedAt!!, c) > 0.08f
 
-        if (!focusInFlight && now >= nextFocusAt && (scaleChanged || (posChanged && (userLocked || offCenter)))) {
+        if ((userLocked || autoShootEnabled) && !focusInFlight && now >= nextFocusAt && (isNewTarget || scaleChanged || posChanged)) {
             focusInFlight = true
             focusOk = false
             val at = PointF(c.x, c.y)
             focusedScale = curScale
+            focusedAt = at
             focus(at) { ok ->
                 focusInFlight = false
-                nextFocusAt = SystemClock.elapsedRealtime() + 900
+                nextFocusAt = SystemClock.elapsedRealtime() + 600
                 focusOk = ok || hwAfFocused
-                focusedAt = at
             }
         } else if (!focusInFlight) {
             focusOk = hwAfFocused

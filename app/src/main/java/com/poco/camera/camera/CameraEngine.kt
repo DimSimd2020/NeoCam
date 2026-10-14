@@ -85,10 +85,10 @@ import kotlin.math.roundToInt
 private const val TAG = "NeoCam"
 
 /**
- * Максимальная выдержка в обычном режиме ФОТО (1/140 с ≈ 7.1 мс),
- * чтобы кадры в движении всегда были резкими и не смазывались.
+ * Максимальная выдержка в обычном режиме ФОТО (1/250 с = 4.0 мс),
+ * чтобы даже быстрое движение руки вблизи камеры замораживалось без смаза.
  */
-private const val MAX_ACTION_SHUTTER_NS = 7_142_857L
+private const val MAX_ACTION_SHUTTER_NS = 4_000_000L
 
 @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
 class CameraEngine(private val context: Context) {
@@ -105,8 +105,6 @@ class CameraEngine(private val context: Context) {
     private val fastFpsRanges = mutableMapOf<String, Range<Int>>()
     private val motionDeblurKeys = mutableMapOf<String, CaptureRequest.Key<Byte>>()
     private val is1PKeys = mutableMapOf<String, CaptureRequest.Key<Byte>>()
-    private val aeMaxGainKeys = mutableMapOf<String, CaptureRequest.Key<Float>>()
-    private val aeGainAtMaxExpKeys = mutableMapOf<String, CaptureRequest.Key<Float>>()
 
     private var camera: Camera? = null
     private var boundConfig: BindConfig? = null
@@ -123,9 +121,8 @@ class CameraEngine(private val context: Context) {
     @Volatile
     var currentAspect: Aspect = Aspect.R4_3
 
-    // Живая оценённая освещённость сцены (ISO * ExposureNs) из AE-цикла для анти-смаза
     @Volatile
-    private var meteredTotalLight: Double = 100.0 * 8_000_000.0
+    private var meteredTotalLight: Double = 0.0
 
     @Volatile
     private var lastAeProbeAt: Long = 0L
@@ -218,17 +215,13 @@ class CameraEngine(private val context: Context) {
                     ?: fpsRanges.firstOrNull { it.lower >= 24 && it.upper >= 30 }
                 if (bestFastFps != null) fastFpsRanges[id] = bestFastFps
 
-                // Аппаратные ключи Pixel Tensor ISP (ZSL HDR+, Motion Deblur, AE Motion Factorization)
+                // Берём только проверенные ключи из availableCaptureRequestKeys
                 runCatching {
                     val allKeys = camManager?.getCameraCharacteristics(id)?.availableCaptureRequestKeys.orEmpty()
                     (allKeys.firstOrNull { it.name.contains("motionDeblur.enabled", true) } as? CaptureRequest.Key<Byte>)
                         ?.let { motionDeblurKeys[id] = it }
                     (allKeys.firstOrNull { it.name.contains("IsCameraApp1P", true) } as? CaptureRequest.Key<Byte>)
                         ?.let { is1PKeys[id] = it }
-                    (allKeys.firstOrNull { it.name.contains("aeMotionFactorizationMaxGainToLimitExposure", true) } as? CaptureRequest.Key<Float>)
-                        ?.let { aeMaxGainKeys[id] = it }
-                    (allKeys.firstOrNull { it.name.contains("aeMotionFactorizationGainAtMaxExposure", true) } as? CaptureRequest.Key<Float>)
-                        ?.let { aeGainAtMaxExpKeys[id] = it }
                 }
 
                 infos[id] = info
@@ -445,8 +438,6 @@ class CameraEngine(private val context: Context) {
         val fastFps = fastFpsRanges[lens.id]
         val deblurKey = motionDeblurKeys[lens.id]
         val is1PKey = is1PKeys[lens.id]
-        val maxGainKey = aeMaxGainKeys[lens.id]
-        val gainAtMaxKey = aeGainAtMaxExpKeys[lens.id]
 
         fun applyFastZslOptions(ext2: Camera2Interop.Extender<*>) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && cfg.mode != CamMode.VIDEO) {
@@ -458,8 +449,6 @@ class CameraEngine(private val context: Context) {
             if (cfg.mode == CamMode.PHOTO) {
                 if (deblurKey != null) ext2.setCaptureRequestOption(deblurKey, 1.toByte())
                 if (is1PKey != null) ext2.setCaptureRequestOption(is1PKey, 1.toByte())
-                if (maxGainKey != null) ext2.setCaptureRequestOption(maxGainKey, 240.0f)
-                if (gainAtMaxKey != null) ext2.setCaptureRequestOption(gainAtMaxKey, 18.0f)
             }
         }
 
@@ -546,7 +535,7 @@ class CameraEngine(private val context: Context) {
                 boundLensId = lens.id
                 boundMode = cfg.mode
                 boundConfig = cfg
-                Log.i(TAG, "bound ${lens.id} ${cfg.mode} $v ext=$usingExt fastFps=$fastFps deblur=${deblurKey != null}")
+                Log.i(TAG, "bound ${lens.id} ${cfg.mode} $v ext=$usingExt fastFps=$fastFps")
                 break
             } catch (e: Exception) {
                 lastError = e
@@ -664,6 +653,7 @@ class CameraEngine(private val context: Context) {
         if (i == s.evIndex) return
         _state.update { it.copy(evIndex = i) }
         camera?.cameraControl?.setExposureCompensationIndex(i)
+        if (boundMode == CamMode.PHOTO) updateAntiBlurAe(force = true)
     }
 
     fun setFlash(flash: FlashSetting) {
@@ -694,7 +684,11 @@ class CameraEngine(private val context: Context) {
         val cam = camera ?: return
         val c2 = runCatching { Camera2CameraControl.from(cam.cameraControl) }.getOrNull() ?: return
         if (boundMode != CamMode.PRO) {
-            runCatching { c2.clearCaptureRequestOptions() }
+            if (boundMode == CamMode.PHOTO && meteredTotalLight > 0.0) {
+                updateAntiBlurAe(force = true)
+            } else {
+                runCatching { c2.clearCaptureRequestOptions() }
+            }
             return
         }
         val lens = currentLens ?: return
@@ -717,17 +711,77 @@ class CameraEngine(private val context: Context) {
         runCatching { c2.setCaptureRequestOptions(b.build()) }
     }
 
+    /**
+     * Сверхкороткая выдержка против смаза (1/250 с = 4.0 мс):
+     * Берёт точную экспозицию, замеренную штатным AE, и пересчитывает её на выдержку 1/250 с
+     * с сохранением непрерывного автофокуса (CONTROL_AF_MODE_CONTINUOUS_PICTURE) и ZSL.
+     */
+    private fun updateAntiBlurAe(force: Boolean = false) {
+        val cam = camera ?: return
+        val lens = currentLens ?: return
+        if (!lens.manualSensor || boundMode != CamMode.PHOTO || _state.value.torch || meteredTotalLight <= 0.0) return
+        val isoRange = lens.isoRange ?: return
+        val expRange = lens.exposureRange ?: return
+        val c2 = runCatching { Camera2CameraControl.from(cam.cameraControl) }.getOrNull() ?: return
+
+        val evStops = _state.value.evIndex * _state.value.evStep
+        val evMul = 2.0.pow(evStops.toDouble())
+        val desiredLight = meteredTotalLight * evMul
+
+        val baseIso = isoRange.lower.coerceAtLeast(40)
+        if (desiredLight / baseIso <= MAX_ACTION_SHUTTER_NS) {
+            if (antiBlurAppliedIso != 0 || force) {
+                antiBlurAppliedIso = 0
+                antiBlurAppliedExp = 0L
+                runCatching { c2.clearCaptureRequestOptions() }
+            }
+            return
+        }
+
+        // Целевая выдержка 1/250 с (4.0 мс); если ISO превышает 3200 в темноте — ослабляем до 1/125 с (8.0 мс)
+        val maxCleanIso = (isoRange.upper * 0.45).roundToInt().coerceIn(800, 3600)
+        var targetExp = MAX_ACTION_SHUTTER_NS.coerceIn(expRange.lower, expRange.upper)
+        var targetIso = (desiredLight / targetExp).roundToInt()
+        if (targetIso > maxCleanIso) {
+            targetExp = 8_000_000L.coerceIn(expRange.lower, expRange.upper)
+            targetIso = (desiredLight / targetExp).roundToInt().coerceIn(isoRange.lower, isoRange.upper)
+        } else {
+            targetIso = targetIso.coerceIn(isoRange.lower, maxCleanIso)
+        }
+
+        val isoDiff = abs(targetIso - antiBlurAppliedIso).toFloat() / antiBlurAppliedIso.coerceAtLeast(1)
+        if (!force && antiBlurAppliedIso > 0 && isoDiff < 0.12f && targetExp == antiBlurAppliedExp) return
+
+        antiBlurAppliedIso = targetIso
+        antiBlurAppliedExp = targetExp
+
+        val b = CaptureRequestOptions.Builder()
+            .setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+            .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
+            .setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, targetExp)
+            .setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, 16_666_666L)
+            .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            b.setCaptureRequestOption(CaptureRequest.CONTROL_ENABLE_ZSL, true)
+        }
+        runCatching { c2.setCaptureRequestOptions(b.build()) }
+    }
+
     private val liveCallback = object : CameraCaptureSession.CaptureCallback() {
         private var last = 0L
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
             val now = SystemClock.elapsedRealtime()
-            if (now - last < 150) return
+            if (now - last < 120) return
             last = now
 
             val afState = result.get(CaptureResult.CONTROL_AF_STATE)
             val focused = afState == null ||
                 afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
                 afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+            val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+            val aeConverged = aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
+                aeState == CaptureResult.CONTROL_AE_STATE_LOCKED
             val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
             val exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
 
@@ -737,6 +791,26 @@ class CameraEngine(private val context: Context) {
                 focus = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f,
                 afFocused = focused,
             )
+
+            val reqAeMode = request.get(CaptureRequest.CONTROL_AE_MODE)
+            if (iso > 0 && exp > 0L) {
+                if (reqAeMode != CameraMetadata.CONTROL_AE_MODE_OFF) {
+                    if (aeConverged) {
+                        meteredTotalLight = iso.toDouble() * exp.toDouble()
+                        lastAeProbeAt = now
+                        if (boundMode == CamMode.PHOTO && exp > MAX_ACTION_SHUTTER_NS) {
+                            updateAntiBlurAe()
+                        }
+                    }
+                } else if (boundMode == CamMode.PHOTO && now - lastAeProbeAt > 1500L && capturing.value == 0) {
+                    lastAeProbeAt = now
+                    val cam = camera
+                    if (cam != null) {
+                        antiBlurAppliedIso = 0
+                        runCatching { Camera2CameraControl.from(cam.cameraControl).clearCaptureRequestOptions() }
+                    }
+                }
+            }
         }
     }
 
