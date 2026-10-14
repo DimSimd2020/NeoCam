@@ -673,9 +673,9 @@ private fun ZoomablePhotoPage(
                 translationY = offset.y
             }
 
-        // Базовый слой из RAM (показывается за 0 мс без ожидания декодирования файла с диска)
+        var fullLoaded by remember(item.uri) { mutableStateOf(false) }
         val bmp = item.previewBitmap
-        if (bmp != null) {
+        if (bmp != null && (!fullLoaded || item.uri == Uri.EMPTY)) {
             val imgBmp = remember(bmp) { bmp.asImageBitmap() }
             Image(
                 bitmap = imgBmp,
@@ -685,12 +685,12 @@ private fun ZoomablePhotoPage(
             )
         }
 
-        // Полноразмерный кадр из MediaStore поверх (когда готов)
         if (item.uri != Uri.EMPTY) {
             AsyncImage(
                 model = item.uri,
                 contentDescription = item.name,
                 contentScale = ContentScale.Fit,
+                onSuccess = { fullLoaded = true },
                 modifier = zoomLayer,
             )
         }

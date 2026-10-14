@@ -2,10 +2,10 @@ package com.poco.camera.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
@@ -30,6 +30,7 @@ import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCase
 import androidx.camera.core.UseCaseGroup
@@ -65,23 +66,29 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.File
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 private const val TAG = "NeoCam"
+
+/**
+ * Максимальная выдержка в обычном режиме ФОТО (1/140 с ≈ 7.1 мс),
+ * чтобы кадры в движении всегда были резкими и не смазывались.
+ */
+private const val MAX_ACTION_SHUTTER_NS = 7_142_857L
 
 @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
 class CameraEngine(private val context: Context) {
@@ -91,11 +98,15 @@ class CameraEngine(private val context: Context) {
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val bindMutex = Mutex()
     private val shotIdGen = AtomicLong(1L)
-    private val hwCaptureBusy = AtomicBoolean(false)
 
     private var provider: ProcessCameraProvider? = null
     private var extensions: ExtensionsManager? = null
     private val infos = mutableMapOf<String, CameraInfo>()
+    private val fastFpsRanges = mutableMapOf<String, Range<Int>>()
+    private val motionDeblurKeys = mutableMapOf<String, CaptureRequest.Key<Byte>>()
+    private val is1PKeys = mutableMapOf<String, CaptureRequest.Key<Byte>>()
+    private val aeMaxGainKeys = mutableMapOf<String, CaptureRequest.Key<Float>>()
+    private val aeGainAtMaxExpKeys = mutableMapOf<String, CaptureRequest.Key<Float>>()
 
     private var camera: Camera? = null
     private var boundConfig: BindConfig? = null
@@ -111,6 +122,19 @@ class CameraEngine(private val context: Context) {
 
     @Volatile
     var currentAspect: Aspect = Aspect.R4_3
+
+    // Живая оценённая освещённость сцены (ISO * ExposureNs) из AE-цикла для анти-смаза
+    @Volatile
+    private var meteredTotalLight: Double = 100.0 * 8_000_000.0
+
+    @Volatile
+    private var lastAeProbeAt: Long = 0L
+
+    @Volatile
+    private var antiBlurAppliedIso: Int = 0
+
+    @Volatile
+    private var antiBlurAppliedExp: Long = 0L
 
     private var mainBack: Lens? = null
     private var ultraWide: Lens? = null
@@ -144,7 +168,7 @@ class CameraEngine(private val context: Context) {
     val currentLens: Lens?
         get() = lenses.firstOrNull { it.id == (boundLensId ?: _state.value.lensId) }
 
-    // ---------------------------------------------------------------- инициализация и автоопределение железа
+    // ---------------------------------------------------------------- инициализация
 
     suspend fun init() = bindMutex.withLock {
         if (provider != null) return@withLock
@@ -165,8 +189,10 @@ class CameraEngine(private val context: Context) {
         }
     }
 
+    @Suppress("UNCHECKED_CAST")
     private fun discover(p: ProcessCameraProvider) {
         class Raw(val lens: Lens, val fov: Float, val pixels: Long)
+        val camManager = context.getSystemService(CameraManager::class.java)
 
         val raws = p.availableCameraInfos.mapNotNull { info ->
             runCatching {
@@ -183,6 +209,28 @@ class CameraEngine(private val context: Context) {
                 val high = map?.getHighResolutionOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.area() }
                 val highRes = if (high != null && normal != null && high.area() > normal.area() * 3 / 2) high else null
                 val minFocus = ch(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+
+                // Выбираем 60 FPS диапазон для короткой выдержки и мгновенного ZSL без смаза в движении
+                val fpsRanges = ch(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
+                val bestFastFps = fpsRanges.firstOrNull { it.lower == 60 && it.upper == 60 }
+                    ?: fpsRanges.firstOrNull { it.lower == 30 && it.upper == 60 }
+                    ?: fpsRanges.firstOrNull { it.lower == 30 && it.upper == 30 }
+                    ?: fpsRanges.firstOrNull { it.lower >= 24 && it.upper >= 30 }
+                if (bestFastFps != null) fastFpsRanges[id] = bestFastFps
+
+                // Аппаратные ключи Pixel Tensor ISP (ZSL HDR+, Motion Deblur, AE Motion Factorization)
+                runCatching {
+                    val allKeys = camManager?.getCameraCharacteristics(id)?.availableCaptureRequestKeys.orEmpty()
+                    (allKeys.firstOrNull { it.name.contains("motionDeblur.enabled", true) } as? CaptureRequest.Key<Byte>)
+                        ?.let { motionDeblurKeys[id] = it }
+                    (allKeys.firstOrNull { it.name.contains("IsCameraApp1P", true) } as? CaptureRequest.Key<Byte>)
+                        ?.let { is1PKeys[id] = it }
+                    (allKeys.firstOrNull { it.name.contains("aeMotionFactorizationMaxGainToLimitExposure", true) } as? CaptureRequest.Key<Float>)
+                        ?.let { aeMaxGainKeys[id] = it }
+                    (allKeys.firstOrNull { it.name.contains("aeMotionFactorizationGainAtMaxExposure", true) } as? CaptureRequest.Key<Float>)
+                        ?.let { aeGainAtMaxExpKeys[id] = it }
+                }
+
                 infos[id] = info
                 Raw(
                     Lens(
@@ -210,8 +258,6 @@ class CameraEngine(private val context: Context) {
         mainBack = main?.lens
         front = raws.firstOrNull { it.lens.facing == CameraSelector.LENS_FACING_FRONT }?.lens
 
-        // Если основная логическая камера 0 уже имеет широкий диапазон CONTROL_ZOOM_RATIO (например 0.55..8.0 на Pixel 8 или Samsung),
-        // она сама бесшовно переключает физические модули внутри HAL — не переключаем cameraId вручную!
         if (main != null && main.lens.minZoom >= 0.95f) {
             val others = backs.drop(1).filter { it.pixels >= 4_000_000 }.map { it.lens.copy(factor = it.fov / main.fov) }
             ultraWide = others.filter { it.factor < 0.85f }.minByOrNull { it.factor }
@@ -251,7 +297,6 @@ class CameraEngine(private val context: Context) {
             else -> max(hwMax, 15f).coerceAtMost(30f)
         }
 
-        // Автоматически строим кнопки зума как в GCam по реальным возможностям камеры устройства
         val stops = if (isFront) {
             buildList {
                 if (minZ < 0.94f) add(minZ)
@@ -376,7 +421,6 @@ class CameraEngine(private val context: Context) {
         val lens = lenses.firstOrNull { it.id == cfg.lensId } ?: return@withLock
         previewView = pv
 
-        // Ждём завершения активного фото-сохранения, чтобы не закрыть камеру посреди снимка
         repeat(20) {
             if (capturing.value == 0) return@repeat
             delay(25)
@@ -384,6 +428,8 @@ class CameraEngine(private val context: Context) {
 
         recording?.stop()
         recording = null
+        antiBlurAppliedIso = 0
+        antiBlurAppliedExp = 0L
 
         val base = selectorFor(lens.id)
         val extMode = when (cfg.mode) {
@@ -395,6 +441,27 @@ class CameraEngine(private val context: Context) {
         val usingExt = extMode != null && ext != null && runCatching { ext.isExtensionAvailable(base, extMode) }.getOrDefault(false)
         val selector = if (usingExt) ext!!.getExtensionEnabledCameraSelector(base, extMode!!) else base
         val ratio = if (cfg.useWideRatio || cfg.mode == CamMode.VIDEO) AspectRatio.RATIO_16_9 else AspectRatio.RATIO_4_3
+
+        val fastFps = fastFpsRanges[lens.id]
+        val deblurKey = motionDeblurKeys[lens.id]
+        val is1PKey = is1PKeys[lens.id]
+        val maxGainKey = aeMaxGainKeys[lens.id]
+        val gainAtMaxKey = aeGainAtMaxExpKeys[lens.id]
+
+        fun applyFastZslOptions(ext2: Camera2Interop.Extender<*>) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && cfg.mode != CamMode.VIDEO) {
+                ext2.setCaptureRequestOption(CaptureRequest.CONTROL_ENABLE_ZSL, true)
+            }
+            if (fastFps != null && cfg.mode != CamMode.VIDEO && cfg.mode != CamMode.NIGHT) {
+                ext2.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fastFps)
+            }
+            if (cfg.mode == CamMode.PHOTO) {
+                if (deblurKey != null) ext2.setCaptureRequestOption(deblurKey, 1.toByte())
+                if (is1PKey != null) ext2.setCaptureRequestOption(is1PKey, 1.toByte())
+                if (maxGainKey != null) ext2.setCaptureRequestOption(maxGainKey, 240.0f)
+                if (gainAtMaxKey != null) ext2.setCaptureRequestOption(gainAtMaxKey, 18.0f)
+            }
+        }
 
         data class Variant(val analysis: Boolean, val highRes: Boolean, val fps60: Boolean, val stab: Boolean)
         val wantHighRes = cfg.highRes && lens.highResSize != null
@@ -414,7 +481,13 @@ class CameraEngine(private val context: Context) {
         for (v in variants) {
             val preview = Preview.Builder()
                 .setResolutionSelector(simpleSelector(ratio))
-                .also { b -> if (!usingExt) Camera2Interop.Extender(b).setSessionCaptureCallback(liveCallback) }
+                .also { b ->
+                    if (!usingExt) {
+                        val ext2 = Camera2Interop.Extender(b)
+                        ext2.setSessionCaptureCallback(liveCallback)
+                        applyFastZslOptions(ext2)
+                    }
+                }
                 .build()
             val useCases = mutableListOf<UseCase>(preview)
             var ic: ImageCapture? = null
@@ -444,6 +517,12 @@ class CameraEngine(private val context: Context) {
                     .setCaptureMode(captureMode)
                     .setResolutionSelector(captureSelector(ratio, v.highRes))
                     .setTargetRotation(targetRotation)
+                    .also { b ->
+                        if (!usingExt) {
+                            val ext2 = Camera2Interop.Extender(b)
+                            applyFastZslOptions(ext2)
+                        }
+                    }
                     .build()
                 useCases += ic
                 if (v.analysis) {
@@ -467,7 +546,7 @@ class CameraEngine(private val context: Context) {
                 boundLensId = lens.id
                 boundMode = cfg.mode
                 boundConfig = cfg
-                Log.i(TAG, "bound ${lens.id} ${cfg.mode} $v ext=$usingExt")
+                Log.i(TAG, "bound ${lens.id} ${cfg.mode} $v ext=$usingExt fastFps=$fastFps deblur=${deblurKey != null}")
                 break
             } catch (e: Exception) {
                 lastError = e
@@ -622,11 +701,11 @@ class CameraEngine(private val context: Context) {
         val b = CaptureRequestOptions.Builder()
         if (lens.manualSensor && (pro.iso != null || pro.shutterNs != null)) {
             val iso = pro.iso ?: live.value.iso.takeIf { it > 0 } ?: 100
-            val exp = pro.shutterNs ?: live.value.shutterNs.takeIf { it > 0 } ?: 10_000_000L
+            val exp = pro.shutterNs ?: live.value.shutterNs.takeIf { it > 0 } ?: 8_000_000L
             b.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
             b.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
             b.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, exp)
-            b.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, max(exp, 33_333_333L))
+            b.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, max(exp, 16_666_666L))
         }
         if (pro.focus != null && lens.hasAf) {
             b.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
@@ -644,20 +723,24 @@ class CameraEngine(private val context: Context) {
             val now = SystemClock.elapsedRealtime()
             if (now - last < 150) return
             last = now
+
             val afState = result.get(CaptureResult.CONTROL_AF_STATE)
             val focused = afState == null ||
                 afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
                 afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+            val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+            val exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+
             live.value = LiveExposure(
-                iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0,
-                shutterNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L,
+                iso = iso,
+                shutterNs = exp,
                 focus = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: 0f,
                 afFocused = focused,
             )
         }
     }
 
-    // ---------------------------------------------------------------- надёжная съёмка фото и видео
+    // ---------------------------------------------------------------- честная мгновенная съёмка с матрицы (ZSL + HDR+ + 60 FPS)
 
     fun capturePhotoInstant(mirrorFront: Boolean) {
         val ic = imageCapture ?: run {
@@ -667,95 +750,69 @@ class CameraEngine(private val context: Context) {
         val s = _state.value
         val extra = s.extraZoom
         val isSquare = currentAspect == Aspect.R1_1 && s.mode != CamMode.VIDEO
+        val isMirror = s.facing == CameraSelector.LENS_FACING_FRONT && mirrorFront
         val shotId = shotIdGen.getAndIncrement()
         val baseName = MediaSaver.newBaseName("IMG_")
 
-        // 1. Мгновенно берём кадр превью для миниатюры галереи (0 мс)
-        val rawPreview = runCatching { previewView?.bitmap }.getOrNull()
-        val previewBmp = rawPreview?.let { cropPreviewIfNeeded(it, extra) }
-        if (previewBmp != null) {
-            events.tryEmit(EngineEvent.InstantCaptured(shotId, previewBmp, "$baseName.jpg"))
-        }
-
-        // 2. Сохраняем через локальный файл в кэше и переносим в MediaStore — 100% надёжность на всех Android
-        val meta = ImageCapture.Metadata().apply {
-            isReversedHorizontal = s.facing == CameraSelector.LENS_FACING_FRONT && mirrorFront
-        }
-        engineScope.launch {
-            capturing.update { it + 1 }
-            val tmp = File(context.cacheDir, "$baseName.jpg")
+        capturing.update { it + 1 }
+        mainExecutor.execute {
             try {
-                val useHw = hwCaptureBusy.compareAndSet(false, true)
-                val savedOk = if (useHw) {
-                    try {
-                        ic.saveToFile(tmp, meta)
-                    } finally {
-                        hwCaptureBusy.set(false)
+                ic.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
+                    override fun onCaptureSuccess(image: ImageProxy) {
+                        val rot = image.imageInfo.rotationDegrees
+                        val bytes = try {
+                            val buf = image.planes[0].buffer
+                            ByteArray(buf.remaining()).also { buf.get(it) }
+                        } finally {
+                            image.close()
+                        }
+
+                        // 1. Декодируем превью из РЕАЛЬНОГО аппаратного JPEG с сенсора (занимает ~10 мс в RAM)
+                        val realBmp = MediaSaver.decodeFastPreviewBitmap(bytes, rot, isMirror, extra, isSquare)
+                        if (realBmp != null) {
+                            events.tryEmit(EngineEvent.InstantCaptured(shotId, realBmp, "$baseName.jpg"))
+                        }
+
+                        // 2. Пишем оригинальный аппаратный JPEG напрямую в MediaStore
+                        engineScope.launch {
+                            try {
+                                val uri = MediaSaver.saveJpegBytes(
+                                    context = context,
+                                    jpegBytes = bytes,
+                                    rotationDegrees = rot,
+                                    mirrorHoriz = isMirror,
+                                    factor = extra,
+                                    squareCrop = isSquare,
+                                    baseName = baseName,
+                                )
+                                if (uri != null) {
+                                    events.tryEmit(EngineEvent.Saved(shotId, uri, isVideo = false))
+                                } else {
+                                    events.tryEmit(EngineEvent.Error("Не удалось сохранить фото"))
+                                }
+                            } finally {
+                                capturing.update { (it - 1).coerceAtLeast(0) }
+                            }
+                        }
                     }
-                } else {
-                    false
-                }
-                val uri = if (savedOk && tmp.exists() && tmp.length() > 0L) {
-                    MediaSaver.saveProcessed(context, tmp, extra, isSquare, baseName)
-                } else if (previewBmp != null) {
-                    val fallbackTmp = File(context.cacheDir, "$baseName-fb.jpg")
-                    try {
-                        fallbackTmp.outputStream().use { previewBmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-                        MediaSaver.insertImageFile(context, fallbackTmp, "$baseName.jpg")
-                    } finally {
-                        fallbackTmp.delete()
+
+                    override fun onError(exception: ImageCaptureException) {
+                        Log.e(TAG, "capture failed (${exception.imageCaptureError})", exception)
+                        capturing.update { (it - 1).coerceAtLeast(0) }
+                        events.tryEmit(EngineEvent.Error("Не удалось сделать снимок"))
                     }
-                } else {
-                    null
-                }
-                if (uri != null) {
-                    events.tryEmit(EngineEvent.Saved(shotId, uri, isVideo = false))
-                } else {
-                    events.tryEmit(EngineEvent.Error("Не удалось сохранить фото"))
-                }
-            } finally {
-                tmp.delete()
+                })
+            } catch (e: Exception) {
+                Log.e(TAG, "takePicture invocation error", e)
                 capturing.update { (it - 1).coerceAtLeast(0) }
             }
         }
     }
 
-    private fun cropPreviewIfNeeded(src: Bitmap, extraZoom: Float): Bitmap {
-        if (extraZoom <= 1.02f) return src
-        val cw = (src.width / extraZoom).roundToInt().coerceIn(16, src.width)
-        val ch = (src.height / extraZoom).roundToInt().coerceIn(16, src.height)
-        val left = (src.width - cw) / 2
-        val top = (src.height - ch) / 2
-        return runCatching { Bitmap.createBitmap(src, left, top, cw, ch) }.getOrDefault(src)
-    }
-
-    private suspend fun ImageCapture.saveToFile(file: File, meta: ImageCapture.Metadata): Boolean =
-        suspendCancellableCoroutine { cont ->
-            val opts = ImageCapture.OutputFileOptions.Builder(file).setMetadata(meta).build()
-            mainExecutor.execute {
-                try {
-                    takePicture(opts, captureExecutor, object : ImageCapture.OnImageSavedCallback {
-                        override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                            if (cont.isActive) cont.resume(true)
-                        }
-
-                        override fun onError(exception: ImageCaptureException) {
-                            Log.e(TAG, "capture failed (${exception.imageCaptureError})", exception)
-                            if (cont.isActive) cont.resume(false)
-                        }
-                    })
-                } catch (e: Exception) {
-                    Log.e(TAG, "takePicture invocation error", e)
-                    if (cont.isActive) cont.resume(false)
-                }
-            }
-        }
-
     @SuppressLint("MissingPermission")
     fun startRecording(withAudio: Boolean) {
         if (recording != null) return
         engineScope.launch(Dispatchers.Main) {
-            // Дожидаемся привязки VideoCapture, если пользователь нажал запись сразу после переключения вкладки
             var vc = videoCapture
             var tries = 0
             while (vc == null && tries < 25) {

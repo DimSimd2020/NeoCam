@@ -12,6 +12,7 @@ import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
 import androidx.exifinterface.media.ExifInterface
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -53,17 +54,122 @@ object MediaSaver {
         ExifInterface.TAG_FOCAL_LENGTH, ExifInterface.TAG_FLASH, ExifInterface.TAG_WHITE_BALANCE,
     )
 
+    /**
+     * Быстрое декодирование уменьшенной копии реального аппаратного JPEG в RAM (для мгновенного превью без мыла).
+     */
+    fun decodeFastPreviewBitmap(
+        jpegBytes: ByteArray,
+        rotationDegrees: Int,
+        mirrorHoriz: Boolean,
+        extraZoom: Float,
+        squareCrop: Boolean,
+    ): Bitmap? = runCatching {
+        val exif = ExifInterface(ByteArrayInputStream(jpegBytes))
+        val exifOri = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_UNDEFINED)
+        val opts = BitmapFactory.Options().apply {
+            inSampleSize = 2
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val raw = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size, opts) ?: return null
+        val m = if (exifOri != ExifInterface.ORIENTATION_UNDEFINED && exifOri != ExifInterface.ORIENTATION_NORMAL) {
+            orientationMatrix(exifOri)
+        } else {
+            Matrix().apply { if (rotationDegrees != 0) postRotate(rotationDegrees.toFloat()) }
+        }
+        if (mirrorHoriz) m.postScale(-1f, 1f)
+
+        val w = raw.width
+        val h = raw.height
+        val baseW = if (squareCrop) min(w, h) else w
+        val baseH = if (squareCrop) min(w, h) else h
+        val z = extraZoom.coerceAtLeast(1f)
+        val cw = (baseW / z).roundToInt().coerceIn(16, w)
+        val ch = (baseH / z).roundToInt().coerceIn(16, h)
+        val left = ((w - cw) / 2).coerceAtLeast(0)
+        val top = ((h - ch) / 2).coerceAtLeast(0)
+
+        val out = Bitmap.createBitmap(raw, left, top, cw, ch, m, true)
+        if (out !== raw) raw.recycle()
+        out
+    }.getOrNull()
+
+    /**
+     * Сохраняет аппаратный JPEG-буфер напрямую в MediaStore (без пережатия при 1x, либо с региональным кропом при зуме).
+     */
+    fun saveJpegBytes(
+        context: Context,
+        jpegBytes: ByteArray,
+        rotationDegrees: Int,
+        mirrorHoriz: Boolean,
+        factor: Float,
+        squareCrop: Boolean,
+        baseName: String,
+    ): Uri? {
+        if (jpegBytes.isEmpty()) return null
+
+        // Если нет цифрового добора, квадратного кропа и зеркалирования — пишем оригинальный аппаратный JPEG напрямую в MediaStore за несколько миллисекунд!
+        if (factor <= 1.02f && !squareCrop && !mirrorHoriz) {
+            val exif = runCatching { ExifInterface(ByteArrayInputStream(jpegBytes)) }.getOrNull()
+            val hasExifOri = exif?.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_UNDEFINED)
+                ?.let { it != ExifInterface.ORIENTATION_UNDEFINED } == true
+            if (hasExifOri || rotationDegrees == 0) {
+                return insertJpegBytesDirect(context, jpegBytes, "$baseName.jpg")
+            }
+        }
+
+        val tmpSrc = File(context.cacheDir, "$baseName-src.jpg")
+        try {
+            tmpSrc.writeBytes(jpegBytes)
+            val exif = ExifInterface(tmpSrc)
+            val curOri = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_UNDEFINED)
+            if (curOri == ExifInterface.ORIENTATION_UNDEFINED || curOri == ExifInterface.ORIENTATION_NORMAL) {
+                val mappedOri = when ((rotationDegrees % 360 + 360) % 360) {
+                    90 -> ExifInterface.ORIENTATION_ROTATE_90
+                    180 -> ExifInterface.ORIENTATION_ROTATE_180
+                    270 -> ExifInterface.ORIENTATION_ROTATE_270
+                    else -> ExifInterface.ORIENTATION_NORMAL
+                }
+                if (mappedOri != ExifInterface.ORIENTATION_NORMAL) {
+                    exif.setAttribute(ExifInterface.TAG_ORIENTATION, mappedOri.toString())
+                    exif.saveAttributes()
+                }
+            }
+            if (factor <= 1.02f && !squareCrop && !mirrorHoriz) {
+                return insertImageFile(context, tmpSrc, "$baseName.jpg")
+            }
+            return saveProcessed(context, tmpSrc, factor, squareCrop, mirrorHoriz, baseName)
+        } finally {
+            tmpSrc.delete()
+        }
+    }
+
+    fun insertJpegBytesDirect(context: Context, bytes: ByteArray, fileName: String): Uri? {
+        val resolver = context.contentResolver
+        val values = imageValues(fileName).apply {
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+        return try {
+            val outStream = resolver.openOutputStream(uri) ?: error("openOutputStream null")
+            outStream.use { it.write(bytes) }
+            resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            uri
+        } catch (e: Exception) {
+            Log.e("NeoCam", "insertJpegBytesDirect failed", e)
+            runCatching { resolver.delete(uri, null, null) }
+            null
+        }
+    }
+
     fun saveProcessed(
         context: Context,
         src: File,
         factor: Float,
         squareCrop: Boolean,
+        mirrorHoriz: Boolean,
         baseName: String,
     ): Uri? {
         if (!src.exists() || src.length() == 0L) return null
-        if (factor <= 1.02f && !squareCrop) {
-            return insertImageFile(context, src, "$baseName.jpg")
-        }
         return try {
             val exif = ExifInterface(src)
             val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
@@ -96,7 +202,10 @@ object MediaSaver {
 
             val targetLong = min(max(baseW, baseH), 4000)
             val scale = (targetLong.toFloat() / max(cw, ch)).coerceIn(1f, z.coerceAtMost(6f))
-            val m = orientationMatrix(orientation).apply { preScale(scale, scale) }
+            val m = orientationMatrix(orientation).apply {
+                preScale(scale, scale)
+                if (mirrorHoriz) postScale(-1f, 1f)
+            }
             val out = Bitmap.createBitmap(cropped, 0, 0, cropped.width, cropped.height, m, true)
             if (out !== cropped) cropped.recycle()
 
