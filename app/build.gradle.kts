@@ -12,8 +12,8 @@ android {
         applicationId = "com.poco.camera"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "2.2"
+        versionCode = 5
+        versionName = "2.3"
         val defProfile = (project.findProperty("defaultProfile") as? String) ?: "PIXEL_8"
         buildConfigField("String", "DEFAULT_PROFILE", "\"$defProfile\"")
         buildConfigField("String", "AUTHOR", "\"DimSimd\"")

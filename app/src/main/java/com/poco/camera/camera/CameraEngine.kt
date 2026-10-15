@@ -324,7 +324,11 @@ class CameraEngine(private val context: Context) {
                 else -> null
             }
         }
-        val astroAvailable = !isFront && base.manualSensor && (base.exposureRange?.upper ?: 0L) >= 1_000_000_000L
+        // Camera2 long exposure on the back camera, or a device-provided Night extension.
+        // Some devices report a maximum individual exposure shorter than 1 second.
+        val astroAvailable = !isFront && (
+            (base.manualSensor && (base.exposureRange?.upper ?: 0L) >= 125_000_000L) || night
+        )
         val stab = caps?.isStabilizationSupported == true
         val fps60 = info?.supportedFrameRateRanges?.any { it.lower >= 60 } == true
         val rawMp = base.highResSize?.let { sz -> (sz.area() / 1_000_000).toInt() }
@@ -352,8 +356,11 @@ class CameraEngine(private val context: Context) {
     fun setMode(mode: CamMode) {
         val s = _state.value
         if (s.recording != null || s.mode == mode) return
-        if (mode == CamMode.NIGHT && !s.nightAvailable) return
-        if (mode == CamMode.ASTRO && !s.astroAvailable) return
+        // Night works with an OEM extension if provided, and falls back to quality capture.
+        if (mode == CamMode.ASTRO && !s.astroAvailable) {
+            events.tryEmit(EngineEvent.Error("Астрофото недоступно: нужна задняя камера с длинной выдержкой или Night Extension"))
+            return
+        }
         if (mode == CamMode.PORTRAIT && !s.portraitAvailable) return
         _state.update { it.copy(mode = mode) }
         updateRanges()
@@ -368,7 +375,6 @@ class CameraEngine(private val context: Context) {
         _state.update { it.copy(facing = lens.facing, lensId = lens.id, zoom = 1f, extraZoom = 1f) }
         updateRanges()
         if (_state.value.mode == CamMode.ASTRO && !_state.value.astroAvailable ||
-            _state.value.mode == CamMode.NIGHT && !_state.value.nightAvailable ||
             _state.value.mode == CamMode.PORTRAIT && !_state.value.portraitAvailable
         ) {
             _state.update { it.copy(mode = CamMode.PHOTO) }
@@ -431,6 +437,7 @@ class CameraEngine(private val context: Context) {
         val base = selectorFor(lens.id)
         val extMode = when (cfg.mode) {
             CamMode.NIGHT -> ExtensionMode.NIGHT
+            CamMode.ASTRO -> if (!lens.manualSensor) ExtensionMode.NIGHT else null
             CamMode.PORTRAIT -> ExtensionMode.BOKEH
             else -> null
         }
@@ -444,7 +451,7 @@ class CameraEngine(private val context: Context) {
         val is1PKey = is1PKeys[lens.id]
 
         fun applyFastZslOptions(ext2: Camera2Interop.Extender<*>) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && cfg.mode != CamMode.VIDEO && cfg.mode != CamMode.ASTRO) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && cfg.mode != CamMode.VIDEO && cfg.mode != CamMode.ASTRO && cfg.mode != CamMode.NIGHT) {
                 ext2.setCaptureRequestOption(CaptureRequest.CONTROL_ENABLE_ZSL, true)
             }
             if (fastFps != null && cfg.mode != CamMode.VIDEO && cfg.mode != CamMode.NIGHT && cfg.mode != CamMode.ASTRO) {
@@ -501,7 +508,7 @@ class CameraEngine(private val context: Context) {
                 }.build()
                 useCases += vc
             } else {
-                val captureMode = if (v.highRes || usingExt) {
+                val captureMode = if (v.highRes || usingExt || cfg.mode == CamMode.NIGHT || cfg.mode == CamMode.ASTRO) {
                     ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY
                 } else {
                     ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
@@ -693,6 +700,7 @@ class CameraEngine(private val context: Context) {
         val c2 = runCatching { Camera2CameraControl.from(cam.cameraControl) }.getOrNull() ?: return
         if (boundMode == CamMode.ASTRO) {
             val lens = currentLens ?: return
+            // With no manual sensor, CameraX Night extension owns the exposure.
             if (!lens.manualSensor) return
             val sec = (boundConfig?.astroExposureSec ?: 2).coerceIn(1, 30)
             val exp = (sec * 1_000_000_000L).coerceIn(

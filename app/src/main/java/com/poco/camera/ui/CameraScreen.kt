@@ -934,15 +934,10 @@ private fun ModeSelectorRow(
     onSelectMode: (CamMode) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val availableModes = remember(state.nightAvailable, state.portraitAvailable, state.astroAvailable) {
-        CamMode.entries.filter { m ->
-            when (m) {
-                CamMode.ASTRO -> state.astroAvailable
-                CamMode.NIGHT -> state.nightAvailable
-                CamMode.PORTRAIT -> state.portraitAvailable
-                else -> true
-            }
-        }
+    // Night mode must remain visible even without an OEM CameraX Night extension.
+    // Astro is also always discoverable; unsupported sensors get a clear error on selection.
+    val availableModes = remember(state.portraitAvailable) {
+        CamMode.entries.filter { mode -> mode != CamMode.PORTRAIT || state.portraitAvailable }
     }
 
     val listState = rememberLazyListState()

@@ -11,9 +11,9 @@ import com.poco.camera.data.Aspect
 import com.poco.camera.data.VideoRes
 
 enum class CamMode(val title: String) {
+    PORTRAIT("Портрет"),
     ASTRO("Астро"),
     NIGHT("Ночь"),
-    PORTRAIT("Портрет"),
     PHOTO("Камера"),
     VIDEO("Видео"),
     PRO("Pro");
